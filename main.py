@@ -4,16 +4,6 @@ SURVIVAL SIMULATION
 ===================
 GPU-accelerated (OpenGL via ModernGL) survival world with
 Numba-JIT AI kernels, full lifecycle, learning agents.
-
-Controls:
-  WASD / Arrow keys  — pan camera
-  Mouse wheel        — zoom
-  +/-                — change simulation speed
-  Click agent        — select / inspect
-  F                  — start fire at cursor
-  R                  — reset simulation
-  SPACE              — pause/unpause
-  ESC                — quit
 """
 
 import sys, os
@@ -29,9 +19,25 @@ from engine.renderer import Renderer
 from engine.hud import draw_hud
 from world.world import World
 from ai.agent import Agent
+from menu import run_menu  # 1. Import the configuration menu module
 
-# ─── init ─────────────────────────────────────────────────────
+# ─── init & pre-launch menu ───────────────────────────────────
 pygame.init()
+
+# 2. Launch configuration screen before binding the OpenGL context
+# We pass gpu_available=True here because the engine requires ModernGL/OpenGL 3.3 core
+menu_settings = run_menu(gpu_available=True)
+
+# If the user closed the window or pressed ESC in the menu, exit cleanly
+if menu_settings is None:
+    pygame.quit()
+    sys.exit(0)
+
+# 3. Dynamic config updates from menu parameters
+import engine.config as cfg
+cfg.INITIAL_AGENTS = menu_settings["population"]
+
+# 4. Initialize OpenGL Display Mode with config dimensions
 pygame.display.set_caption("Survival Simulation — GPU Edition")
 flags = pygame.DOUBLEBUF | pygame.OPENGL | pygame.RESIZABLE
 screen = pygame.display.set_mode((SCREEN_W, SCREEN_H), flags)
@@ -69,15 +75,29 @@ hud_vao  = ctx.vertex_array(hud_prog, [(fs_vbo, '2f', 'in_vert')])
 hud_prog["u_tex"].value = 0
 
 # ─── simulation state ─────────────────────────────────────────
-world    = World(seed=random.randint(0, 999))
+# 5. Apply the customized seed and seasonal parameters from menu
+world = World(seed=menu_settings["terrain_seed"])
+
+# If your World object has attributes to parse seasons, map them here:
+if hasattr(world, "enable_seasons"):
+    world.enable_seasons = menu_settings["seasons"]
+    world.current_season = menu_settings["start_season"]
+
 agents   = []
 renderer = Renderer(ctx, SCREEN_W, SCREEN_H)
 
-# spawn initial agents
-for i in range(INITIAL_AGENTS):
+# spawn initial agents matching menu settings
+# 6. Explicitly forward 'neural_size' constraint to custom agent architectures if applicable
+for i in range(cfg.INITIAL_AGENTS):
     x = random.uniform(WORLD_W * 0.2, WORLD_W * 0.8)
     y = random.uniform(WORLD_H * 0.2, WORLD_H * 0.8)
-    a = Agent(x, y)
+    
+    # Injecting custom neural parameters if supported by Agent __init__
+    if "neural_size" in menu_settings:
+        a = Agent(x, y, hidden_size=menu_settings["neural_size"])
+    else:
+        a = Agent(x, y)
+        
     a.inv_add("berry", 3, freshness=90.0)
     a.inv_add("rock",  2)
     agents.append(a)
@@ -95,12 +115,24 @@ pan_speed  = 40.0  # tiles per second when panning
 
 def reset():
     global world, agents, pop_history, selected_agent
-    world    = World(seed=random.randint(0, 999))
-    agents   = []
-    for i in range(INITIAL_AGENTS):
+    # Generate a random seed during hot resets or track menu settings
+    new_seed = random.randint(0, 999) if menu_settings is None else menu_settings["terrain_seed"]
+    world = World(seed=new_seed)
+    
+    if hasattr(world, "enable_seasons"):
+        world.enable_seasons = menu_settings["seasons"]
+        world.current_season = menu_settings["start_season"]
+
+    agents = []
+    for i in range(cfg.INITIAL_AGENTS):
         x = random.uniform(WORLD_W * 0.2, WORLD_W * 0.8)
         y = random.uniform(WORLD_H * 0.2, WORLD_H * 0.8)
-        a = Agent(x, y)
+        
+        if "neural_size" in menu_settings:
+            a = Agent(x, y, hidden_size=menu_settings["neural_size"])
+        else:
+            a = Agent(x, y)
+            
         a.inv_add("berry", 3, freshness=90.0)
         a.inv_add("rock",  2)
         agents.append(a)
