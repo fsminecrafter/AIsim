@@ -19,7 +19,7 @@ from engine.renderer import Renderer
 from engine.hud import draw_hud
 from world.world import World
 from ai.agent import Agent
-from menu import run_menu  # 1. Import the configuration menu module
+from engine.menu import run_menu  # 1. Import the configuration menu module
 
 # ─── init & pre-launch menu ───────────────────────────────────
 pygame.init()
