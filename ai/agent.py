@@ -15,26 +15,22 @@ import math, random, uuid
 from world.world import *
 from engine.config import *
 
-# ─── Action IDs ───────────────────────────────────────────────
-A_FLEE_FIRE    = 0
-A_DRINK        = 1
-A_SEEK_SAFETY  = 2
-A_FIND_WATER   = 3
-A_FIND_FOOD    = 4
-A_SEEK_WARMTH  = 5
-A_FORAGE       = 6
-A_STOCKPILE    = 7
-A_CRAFT_TOOL   = 8
-A_BUILD        = 9
-A_SEEK_MATE    = 10
-A_WANDER       = 11
-NUM_ACTIONS    = 12
-
-ACTION_NAMES = [
-    "🔥Flee", "💧Drink", "🛡Safety", "🔍Water", "🍎Food",
-    "🌡Warmth", "🌾Forage", "📦Stock", "🔨Craft", "🏠Build",
-    "❤Mate", "👣Wander"
-]
+from ai.actions import (
+    ACTION_NAMES,
+    NUM_ACTIONS,
+    A_FLEE_FIRE,
+    A_DRINK,
+    A_SEEK_SAFETY,
+    A_FIND_WATER,
+    A_FIND_FOOD,
+    A_SEEK_WARMTH,
+    A_FORAGE,
+    A_STOCKPILE,
+    A_CRAFT_TOOL,
+    A_BUILD,
+    A_SEEK_MATE,
+    A_WANDER,
+)
 
 ITEM_FOOD_VALUE = {
     "berry": 15, "wheat": 8, "bread": 40, "cooked_meat": 50

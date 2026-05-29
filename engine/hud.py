@@ -7,7 +7,7 @@ population chart, learning weights radar, event log.
 import pygame
 import math
 from engine.config import *
-from ai.agent import ACTION_NAMES, NUM_ACTIONS
+from ai.actions import ACTION_NAMES, NUM_ACTIONS
 
 FONT_MONO = None
 FONT_TITLE = None
