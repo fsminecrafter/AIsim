@@ -26,17 +26,6 @@ THIRST_DECAY   = 2.0 / 60.0
 WARMTH_DECAY   = 0.5 / 60.0
 MOOD_DECAY     = 0.3 / 60.0
 
-O_TREE = 1
-O_BERRY = 2
-O_WHEAT = 3
-O_ROCK_OBJ = 4
-
-S_FIREPLACE = 10
-S_HOUSE = 11
-
-# Rendering 3D Configuration
-RENDER_SCALE = 2.0  # Scale multiplier converting grid slots into 3D meters
-
 # Time
 DAY_DURATION       = 60.0
 SEASON_DAYS        = 20
