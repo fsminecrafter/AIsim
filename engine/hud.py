@@ -1,5 +1,12 @@
 """
 HUD — draws stats overlay using pygame surfaces, composited over the GL frame.
+
+v3 additions:
+  * FIX 3 — Sleep icon above sleeping colonists (drawn in draw_agent_icons)
+  * FIX 4 — Pregnancy icon above pregnant colonists + inspector status
+  * FIX 5 — Heart effect at colonist position when reproducing
+  * FIX 6 — Friends list in inspector; returns clicked friend ID for
+             selection in main.py
 """
 
 import pygame
@@ -60,6 +67,8 @@ ACTION_COLS = {
     9:  (220, 185,  90),
     10: (255,  80, 180),
     11: (140, 140, 155),
+    12: (100, 140, 220),   # A_SLEEP — blue-grey
+    13: (200, 220, 140),   # A_RECREATE — light green
 }
 
 STAGE_COLS = {
@@ -99,6 +108,89 @@ def _label(surf, x, y, text, font, col=(200, 205, 220)):
     t = font.render(text, True, col)
     surf.blit(t, (x, y))
     return t.get_width()
+
+
+# ── world-space → screen coords helper ───────────────────────
+
+def world_to_screen(wx, wz, renderer):
+    """
+    Project 3-D world position (wx, wy=0, wz) to 2-D screen pixels.
+    Returns (sx, sy) or None if behind the camera.
+    Used to place icons above agents.
+    """
+    import numpy as np
+    view, mvp = renderer._get_view_proj()
+    # Head position: lift a bit above the tile
+    pos  = np.array([wx, 1.8, wz, 1.0], dtype=np.float32)
+    clip = mvp @ pos
+    if clip[3] <= 0:
+        return None
+    ndc_x = clip[0] / clip[3]
+    ndc_y = clip[1] / clip[3]
+    sx = int((ndc_x + 1.0) * 0.5 * renderer.screen_w)
+    sy = int((1.0 - (ndc_y + 1.0) * 0.5) * renderer.screen_h)
+    return (sx, sy)
+
+
+# ── per-agent icon rendering (FIX 3 / 4 / 5) ─────────────────
+
+def draw_agent_icons(screen_surf, agents, renderer):
+    """
+    Draw sleep / pregnancy / heart icons above live agents in world-space.
+    This must be called after the GL render and before pygame.display.flip().
+    """
+    ensure_fonts()
+    for ag in agents:
+        if ag.is_dead:
+            continue
+
+        wx = ag.x * TILE_SIZE + TILE_SIZE / 2
+        wz = ag.y * TILE_SIZE + TILE_SIZE / 2
+        screen_pos = world_to_screen(wx, wz, renderer)
+        if screen_pos is None:
+            continue
+        sx, sy = screen_pos
+
+        # Clip to screen
+        if sx < -20 or sx > screen_surf.get_width() + 20:
+            continue
+        if sy < -20 or sy > screen_surf.get_height() + 20:
+            continue
+
+        offset_y = sy - 22   # baseline above head
+
+        icons = []
+
+        # FIX 3 — Sleep icon
+        if getattr(ag, "sleeping", False):
+            icons.append(("😴", (120, 160, 240)))
+
+        # FIX 4 — Pregnancy icon
+        if ag.preg_timer is not None and ag.preg_timer > 0:
+            icons.append(("🤰", (240, 160, 200)))
+
+        # FIX 5 — Heart effect (appears on both partners for a few seconds)
+        if getattr(ag, "heart_effect_timer", 0) > 0:
+            # Float the heart upward over its lifetime
+            total   = 3.0  # HEART_EFFECT_DURATION
+            frac    = ag.heart_effect_timer / total
+            float_y = int((1.0 - frac) * 18)   # moves up as frac drops
+            icon_surf = FONT_TITLE.render("❤", True, (255, 80, 120))
+            alpha     = int(255 * frac)
+            icon_surf.set_alpha(alpha)
+            screen_surf.blit(icon_surf, (sx - icon_surf.get_width() // 2,
+                                         offset_y - 14 - float_y))
+
+        # Draw stacked icons left-to-right centred on sx
+        total_w = len(icons) * 16
+        ix = sx - total_w // 2
+        for text, col in icons:
+            try:
+                t = FONT_SM.render(text, True, col)
+            except Exception:
+                t = FONT_XS.render("?", True, col)
+            screen_surf.blit(t, (ix, offset_y))
+            ix += t.get_width() + 2
 
 
 # ── colonist leaderboard ──────────────────────────────────────
@@ -160,7 +252,15 @@ def draw_colonist_panel(screen_surf, mx, my, agents, selected_agent,
         _label(screen_surf, px + 26, ry + 2, gicon, FONT_XS, gcol)
 
         ncol = (255, 255, 200) if is_sel else ((255, 255, 255) if hovered else (215, 218, 228))
-        _label(screen_surf, px + 38, ry + 2, str(ag.id)[:10], FONT_XS, ncol)
+
+        # Show sleep / pregnancy icon in list
+        extra = ""
+        if getattr(ag, "sleeping", False):
+            extra += "😴"
+        if ag.preg_timer is not None:
+            extra += "🤰"
+        name_txt = str(ag.id)[:8] + (extra if extra else "")
+        _label(screen_surf, px + 38, ry + 2, name_txt, FONT_XS, ncol)
 
         scol   = STAGE_COLS.get(ag.stage, (180, 180, 180))
         sbadge = FONT_XS.render(ag.stage[:3].upper(), True, scol)
@@ -268,8 +368,13 @@ def draw_hud(screen_surf, world, agents, selected_agent, pop_history,
     screen_surf.blit(ht, ((W - ht.get_width()) // 2, H - 14))
 
     # ══ SELECTED AGENT PANEL (right side) ════════════════════
+    # Returns the id of any friend that was clicked (or None).
+    clicked_friend_id = None
     if selected_agent and not selected_agent.is_dead:
-        _draw_agent_panel(screen_surf, selected_agent, W, H)
+        clicked_friend_id = _draw_agent_panel(
+            screen_surf, selected_agent, W, H,
+            agents, pygame.mouse.get_pos(),
+        )
 
     # ══ MINI EVENT LOG ════════════════════════════════════════
     if selected_agent and selected_agent.event_log:
@@ -285,12 +390,19 @@ def draw_hud(screen_surf, world, agents, selected_agent, pop_history,
             _label(screen_surf, log_x + 155, log_y + i * 14,
                    f"{reward:+.2f}", FONT_XS, rcol)
 
+    return clicked_friend_id   # NEW: propagate to main.py for friend-click selection
+
 
 # ── agent detail panel ────────────────────────────────────────
 
-def _draw_agent_panel(surf, ag, W, H):
+def _draw_agent_panel(surf, ag, W, H, agents=None, mouse_pos=None):
+    """
+    Draws the selected-agent inspector.
+    Returns the agent ID of a clicked friend entry, or None.
+    (FIX 6 — friend list is clickable)
+    """
     ensure_fonts()
-    pw, ph = 215, 330
+    pw, ph = 215, 400   # taller to fit friend list
     px = W - pw - 8
     py = 40
     _panel(surf, px, py, pw, ph, alpha=215)
@@ -303,66 +415,211 @@ def _draw_agent_panel(surf, ag, W, H):
     g_icon = "♂" if ag.gender == "male" else "♀"
     g_col  = (110, 170, 240) if ag.gender == "male" else (240, 120, 185)
     _label(surf, px + 155, py + 6, g_icon, FONT_TITLE, g_col)
-    # Camera-follow indicator (camera always follows selected colonist)
     _label(surf, px + 175, py + 6, "📷", FONT_XS, (120, 220, 255))
     _label(surf, px + 8, py + 22,
            f"Gen {ag.generation}  Winters {ag.winters}", FONT_XS, (130, 135, 160))
 
-    # ── Exploration trait bar ─────────────────────────────────
+    # ── FIX 4 — Pregnancy status ──────────────────────────────
+    preg_line = ""
+    if ag.preg_timer is not None and ag.preg_timer > 0:
+        preg_pct = int((1.0 - ag.preg_timer / 30.0) * 100)
+        preg_line = f"🤰 Pregnant  {preg_pct}%"
+    elif ag.postpartum_timer > 0:
+        preg_line = "🍼 Postpartum rest"
+
+    # ── FIX 3 — Sleep status ──────────────────────────────────
+    sleep_line = ""
+    if getattr(ag, "sleeping", False):
+        remaining = int(getattr(ag, "sleep_timer", 0))
+        sleep_line = f"😴 Sleeping  {remaining}s left"
+
+    row_y = py + 34
+
+    # Exploration bar
     exp  = getattr(ag, "exploration", 0.3)
     ex_w = pw - 16
     ex_h = 10
-    ex_y = py + 34
-    pygame.draw.rect(surf, (25, 27, 35), (px + 8, ex_y, ex_w, ex_h))
+    pygame.draw.rect(surf, (25, 27, 35), (px + 8, row_y, ex_w, ex_h))
     fill_w = int(ex_w * exp)
-    # Gradient: blue (homebody) → orange (explorer)
-    exp_r = int(60  + exp * 195)
-    exp_g = int(120 - exp * 60)
-    exp_b = int(220 - exp * 170)
-    pygame.draw.rect(surf, (exp_r, exp_g, exp_b), (px + 8, ex_y, fill_w, ex_h))
-    pygame.draw.rect(surf, (65, 70, 95), (px + 8, ex_y, ex_w, ex_h), 1)
-    _label(surf, px + 10, ex_y, f"EXPLORE {exp:.2f}", FONT_XS, (200, 200, 220))
+    exp_r  = int(60  + exp * 195)
+    exp_g  = int(120 - exp * 60)
+    exp_b  = int(220 - exp * 170)
+    pygame.draw.rect(surf, (exp_r, exp_g, exp_b), (px + 8, row_y, fill_w, ex_h))
+    pygame.draw.rect(surf, (65, 70, 95), (px + 8, row_y, ex_w, ex_h), 1)
+    _label(surf, px + 10, row_y, f"EXPLORE {exp:.2f}", FONT_XS, (200, 200, 220))
+    row_y += 12
 
-    by = py + 48
+    # Status lines (pregnancy / sleep)
+    if preg_line:
+        _label(surf, px + 8, row_y, preg_line, FONT_XS, (255, 160, 200))
+        row_y += 13
+    if sleep_line:
+        _label(surf, px + 8, row_y, sleep_line, FONT_XS, (120, 160, 240))
+        row_y += 13
+
+    # Vitals bars
     for stat, col in VITAL_COLS.items():
         val = getattr(ag, stat, 100)
-        _bar(surf, px + 8, by, pw - 16, 15, val, col, stat[:3].upper(), FONT_XS)
-        by += 18
+        _bar(surf, px + 8, row_y, pw - 16, 15, val, col, stat[:3].upper(), FONT_XS)
+        row_y += 18
 
     if ag.crafting_item and ag.craft_remaining > 0:
         from ai.agent import CRAFT_TIME
         total = CRAFT_TIME.get(ag.crafting_item, 3.0)
         pct   = 1.0 - ag.craft_remaining / max(total, 0.01)
-        pygame.draw.rect(surf, (35, 38, 50),    (px+8, by, pw-16, 12))
-        pygame.draw.rect(surf, (200, 150, 60),  (px+8, by, int((pw-16)*pct), 12))
-        pygame.draw.rect(surf, (80, 85, 110),   (px+8, by, pw-16, 12), 1)
-        _label(surf, px + 10, by, f"Crafting {ag.crafting_item}", FONT_XS, (235, 200, 110))
-        by += 14
+        pygame.draw.rect(surf, (35, 38, 50),    (px+8, row_y, pw-16, 12))
+        pygame.draw.rect(surf, (200, 150, 60),  (px+8, row_y, int((pw-16)*pct), 12))
+        pygame.draw.rect(surf, (80, 85, 110),   (px+8, row_y, pw-16, 12), 1)
+        _label(surf, px + 10, row_y, f"Crafting {ag.crafting_item}", FONT_XS, (235, 200, 110))
+        row_y += 14
 
-    by += 2
+    row_y += 2
     aname = ACTION_NAMES[ag.current_action] if ag.current_action is not None else "?"
     acol  = ACTION_COLS.get(ag.current_action, (180, 180, 180))
-    pygame.draw.rect(surf, (*acol, 60), (px+8, by, pw-16, 16))
-    pygame.draw.rect(surf, acol,        (px+8, by, pw-16, 16), 1)
-    _label(surf, px + 10, by + 1, f"▶ {aname}", FONT_XS, acol)
-    by += 20
+    pygame.draw.rect(surf, (*acol, 60), (px+8, row_y, pw-16, 16))
+    pygame.draw.rect(surf, acol,        (px+8, row_y, pw-16, 16), 1)
+    _label(surf, px + 10, row_y + 1, f"▶ {aname}", FONT_XS, acol)
+    row_y += 20
 
-    _label(surf, px + 8, by, "INVENTORY", FONT_XS, (90, 98, 125))
-    by += 13
-    for itype, idata in list(ag.inventory.items())[:6]:
+    # Inventory
+    _label(surf, px + 8, row_y, "INVENTORY", FONT_XS, (90, 98, 125))
+    row_y += 13
+    for itype, idata in list(ag.inventory.items())[:5]:
         qty   = idata["quantity"]
         fresh = idata.get("freshness")
         col   = (225, 100, 80) if (fresh is not None and fresh < 30) else (200, 195, 150)
-        _label(surf, px + 8, by, f"  {itype[:14]:<14} ×{qty}", FONT_XS, col)
-        by += 12
+        _label(surf, px + 8, row_y, f"  {itype[:14]:<14} ×{qty}", FONT_XS, col)
+        row_y += 12
 
-    if len(ag.inventory) > 6:
-        _label(surf, px + 8, by, f"  +{len(ag.inventory)-6} more…", FONT_XS, (90, 95, 120))
-        by += 12
+    if len(ag.inventory) > 5:
+        _label(surf, px + 8, row_y, f"  +{len(ag.inventory)-5} more…", FONT_XS, (90, 95, 120))
+        row_y += 12
 
-    by += 4
-    if by + 78 < py + ph - 4:
-        _draw_radar(surf, px + 8, by, pw - 16, 70, ag.weights)
+    # ── FIX 6 — Friends list ──────────────────────────────────
+    clicked_friend_id = _draw_friends_list(
+        surf, ag, agents, px + 8, row_y, pw - 16, H - (row_y + py),
+        mouse_pos,
+    )
+
+    # Radar (only if space remains)
+    row_y += _friends_list_height(ag)
+    if row_y + 78 < py + ph - 4:
+        _draw_radar(surf, px + 8, row_y + 4, pw - 16, 70, ag.weights)
+
+    return clicked_friend_id
+
+
+def _friends_list_height(ag):
+    """Estimate pixel height the friends list will consume."""
+    friends = getattr(ag, "friends", {})
+    # family entries + non-family friends, capped at 6 displayed
+    n = min(len(friends) + len(getattr(ag, "parent_ids", [])) + len(getattr(ag, "children_ids", [])), 6)
+    if n == 0:
+        return 14   # just header
+    return 14 + n * 14 + 4
+
+
+def _draw_friends_list(surf, ag, agents, x, y, w, max_h, mouse_pos):
+    """
+    FIX 6 — Render friend/family list in the inspector.
+    Returns clicked friend agent ID, or None.
+    """
+    ensure_fonts()
+    if agents is None:
+        return None
+
+    # Build display list: family first, then non-family friends sorted by score
+    entries = []  # (agent_id, label, score, is_family)
+
+    # Parent links
+    for pid in getattr(ag, "parent_ids", []):
+        entries.append((pid, "Parent", 999.0, True))
+
+    # Child links
+    for cid in getattr(ag, "children_ids", []):
+        entries.append((cid, "Child", 999.0, True))
+
+    # Non-family friends
+    friends = getattr(ag, "friends", {})
+    sorted_friends = sorted(friends.items(), key=lambda kv: -kv[1])
+    for fid, score in sorted_friends:
+        if fid not in getattr(ag, "parent_ids", []) and fid not in getattr(ag, "children_ids", []):
+            entries.append((fid, f"{score:.0f}", score, False))
+
+    # Cap displayed entries
+    entries = entries[:6]
+
+    # Build lookup for display names
+    id_to_agent = {}
+    if agents:
+        for a in agents:
+            id_to_agent[a.id] = a
+
+    header_h = 14
+    _label(surf, x, y, "FRIENDS / FAMILY", FONT_XS, (90, 98, 125))
+    y += header_h
+
+    if not entries:
+        _label(surf, x + 4, y, "  (none yet)", FONT_XS, (60, 65, 85))
+        return None
+
+    clicked_id = None
+    mx, my = mouse_pos if mouse_pos else (-1, -1)
+
+    for entry_id, label, score, is_fam in entries:
+        row_h = 14
+        if y + row_h > surf.get_height() - 4:
+            break
+
+        other = id_to_agent.get(entry_id)
+        dead  = (other is None or other.is_dead)
+
+        # Row hover
+        hovered = (x <= mx <= x + w and y <= my <= y + row_h)
+
+        if hovered and not dead:
+            hs = pygame.Surface((w, row_h), pygame.SRCALPHA)
+            hs.fill((60, 90, 130, 110))
+            surf.blit(hs, (x, y))
+            clicked_id = entry_id   # return on any hover click (main checks button)
+
+        # Colour coding
+        if dead:
+            name_col = (60, 65, 80)
+            label_col = (50, 55, 70)
+        elif is_fam:
+            name_col  = (220, 200, 120)
+            label_col = (160, 145, 80)
+        else:
+            # Colour by friendship tier
+            if score >= 50:
+                name_col = (130, 230, 130)
+            elif score >= 25:
+                name_col = (200, 220, 160)
+            else:
+                name_col = (160, 170, 180)
+            label_col = (100, 110, 120)
+
+        icon = "💀" if dead else ("👨‍👩‍👧" if is_fam else "🤝")
+        gender_icon = ""
+        if other and not dead:
+            gender_icon = "♂" if other.gender == "male" else "♀"
+            g_col = (110, 170, 240) if other.gender == "male" else (240, 120, 185)
+        else:
+            g_col = (100, 100, 100)
+
+        name_str = str(entry_id)[:9]
+        _label(surf, x + 2,  y, icon,                FONT_XS, (180, 180, 180))
+        _label(surf, x + 16, y, gender_icon,          FONT_XS, g_col)
+        _label(surf, x + 26, y, name_str,             FONT_XS, name_col)
+        _label(surf, x + 96, y, label if is_fam else f"♥{label}", FONT_XS, label_col)
+
+        if hovered and not dead:
+            pygame.draw.rect(surf, (80, 130, 200), (x, y, w, row_h), 1)
+
+        y += row_h
+
+    return clicked_id
 
 
 # ── radar / compass ───────────────────────────────────────────
@@ -407,3 +664,4 @@ def _draw_compass(surf, cx, cy, yaw_deg):
     pygame.draw.line(surf, (100, 110, 135), (cx, cy), (sx, sy), 2)
     t = FONT_XS.render("N", True, (220, 80, 70))
     surf.blit(t, (nx - 4, ny - 6))
+    
