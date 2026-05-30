@@ -1,6 +1,11 @@
 """
 World engine — terrain, resources, fire, day/night/season
 Uses Numba JIT for hot-path kernels (fire spread, growth update).
+
+v2 additions:
+  * near_river() now accepts an arbitrary radius (used by baby agents for
+    proximity drinking without pathing to the river centre).
+  * find_nearest_water_tile() for fine-grained water detection.
 """
 
 import numpy as np
@@ -136,10 +141,8 @@ def astar(terrain_passable, fire_map, start_y, start_x, goal_y, goal_x):
     f_cost[start_y, start_x] = h
     in_open[start_y, start_x] = True
 
-    # simple open list (linear scan — fine for 80x80 grid)
     MAX_ITER = 800
     for _ in range(MAX_ITER):
-        # find min f in open
         best_f = INF
         cy, cx = -1, -1
         for yy in range(H):
@@ -150,7 +153,6 @@ def astar(terrain_passable, fire_map, start_y, start_x, goal_y, goal_x):
         if cy < 0:
             break
         if cy == goal_y and cx == goal_x:
-            # reconstruct
             path = []
             py, px = cy, cx
             while py >= 0:
@@ -173,7 +175,6 @@ def astar(terrain_passable, fire_map, start_y, start_x, goal_y, goal_x):
             if not terrain_passable[ny, nx]:
                 continue
             move_cost = 1.5 if fire_map[ny, nx] > 0 else 1.0
-            # river = slow
             ng = g_cost[cy, cx] + move_cost
             if ng < g_cost[ny, nx]:
                 g_cost[ny, nx] = ng
@@ -217,12 +218,12 @@ class World:
         self.rng_seeds = rng.integers(0, 2**31, (H, W), dtype=np.int64).astype(np.int64)
 
         # ── structures ───────────────────────────────────────
-        self.structures = np.zeros((H, W), dtype=np.int32)  # S_NONE/HOUSE/FIREPLACE
+        self.structures = np.zeros((H, W), dtype=np.int32)
 
         # ── time ─────────────────────────────────────────────
-        self.time_of_day  = 0.0   # 0-1, 0=dawn 0.5=dusk
+        self.time_of_day  = 0.0
         self.day_number   = 0
-        self.season_idx   = 0     # 0=spring
+        self.season_idx   = 0
         self.total_time   = 0.0
 
         # ── weather ──────────────────────────────────────────
@@ -230,18 +231,18 @@ class World:
         self._weather_timer = 0.0
         self._next_weather_change = self._rand_weather_interval()
 
-        # ── dropped items (from dead agents) ─────────────────
-        self.dropped_items = {}   # (y,x) -> list of item dicts
+        # ── dropped items ─────────────────────────────────────
+        self.dropped_items = {}
 
         # precompute passable mask
         self._update_passable()
 
     # ── terrain generation ───────────────────────────────────
+
     def _generate_terrain(self, rng):
         H, W = WORLD_H, WORLD_W
         try:
             import noise
-            # Perlin noise for elevation
             elev = np.zeros((H, W), dtype=np.float32)
             for y in range(H):
                 for x in range(W):
@@ -259,14 +260,12 @@ class World:
                 else:
                     self.terrain[y, x] = T_DIRT
 
-        # carve 2-3 rivers
         num_rivers = rng.integers(2, 4)
         for _ in range(num_rivers):
             self._carve_river(rng)
 
     def _carve_river(self, rng):
         H, W = WORLD_H, WORLD_W
-        # random walk from top to bottom (or left to right)
         horizontal = rng.random() > 0.5
         if horizontal:
             y = int(rng.integers(H // 4, 3 * H // 4))
@@ -315,10 +314,7 @@ class World:
                         self.obj_rate[y, x] = 0.0
 
     def _calc_moisture(self):
-        H, W = WORLD_H, WORLD_W
         river_mask = (self.terrain == T_RIVER).astype(np.float32)
-        # simple distance-based moisture
-        from scipy.ndimage import gaussian_filter
         try:
             from scipy.ndimage import gaussian_filter as gf
             self.moisture = gf(river_mask, sigma=4.0).astype(np.float32)
@@ -327,10 +323,10 @@ class World:
             self.moisture = river_mask * 0.8
 
     def _update_passable(self):
-        """Recompute tile passability (no fire, not rock structure)."""
         self.passable = (self.terrain != T_ROCK).astype(np.bool_)
 
     # ── weather ──────────────────────────────────────────────
+
     def _rand_weather_interval(self):
         return random.uniform(DAY_DURATION * 3, DAY_DURATION * 8)
 
@@ -340,14 +336,11 @@ class World:
         "autumn": ["cloudy", "rain", "storm", "clear"],
         "winter": ["clear", "cloudy", "blizzard", "blizzard"],
     }
-    WEATHER_FIRE_MULT = {
-        "clear": 1.5, "cloudy": 1.0, "rain": 0.1, "storm": 0.0, "blizzard": 0.0
-    }
-    WEATHER_MOOD_MULT    = {"clear": 1.0, "cloudy": 1.1, "rain": 1.8, "storm": 2.5, "blizzard": 3.0}
-    WEATHER_HUNGER_MULT  = {"clear": 1.0, "cloudy": 1.0, "rain": 1.5, "storm": 2.0, "blizzard": 2.0}
-    WEATHER_WARMTH_MULT  = {"clear": 1.0, "cloudy": 1.1, "rain": 2.0, "storm": 3.0, "blizzard": 5.0}
-
-    SEASON_COLD_MULT     = {"spring": 0.5, "summer": 0.2, "autumn": 0.8, "winter": 3.0}
+    WEATHER_FIRE_MULT   = {"clear": 1.5, "cloudy": 1.0, "rain": 0.1, "storm": 0.0, "blizzard": 0.0}
+    WEATHER_MOOD_MULT   = {"clear": 1.0, "cloudy": 1.1, "rain": 1.8, "storm": 2.5, "blizzard": 3.0}
+    WEATHER_HUNGER_MULT = {"clear": 1.0, "cloudy": 1.0, "rain": 1.5, "storm": 2.0, "blizzard": 2.0}
+    WEATHER_WARMTH_MULT = {"clear": 1.0, "cloudy": 1.1, "rain": 2.0, "storm": 3.0, "blizzard": 5.0}
+    SEASON_COLD_MULT    = {"spring": 0.5, "summer": 0.2, "autumn": 0.8, "winter": 3.0}
 
     @property
     def season_name(self):
@@ -358,42 +351,35 @@ class World:
         return self.time_of_day < 0.5
 
     # ── tick ─────────────────────────────────────────────────
+
     def tick(self, real_dt):
         sim_dt = real_dt * SIM_SPEED
 
-        # ── time advancement ─────────────────────────────────
-        self.total_time   += sim_dt
-        prev_day = int(self.time_of_day * 2)
-        self.time_of_day   = (self.time_of_day + sim_dt / DAY_DURATION) % 1.0
-        # check day rollover
+        self.total_time  += sim_dt
+        self.time_of_day  = (self.time_of_day + sim_dt / DAY_DURATION) % 1.0
         if int(self.total_time / DAY_DURATION) > self.day_number:
             self.day_number += 1
             if self.day_number % SEASON_DAYS == 0:
                 self.season_idx = (self.season_idx + 1) % 4
 
-        # ── weather ──────────────────────────────────────────
         self._weather_timer += sim_dt
         if self._weather_timer >= self._next_weather_change:
             pool = self.WEATHER_CYCLE[self.season_name]
             self.weather = random.choice(pool)
             self._weather_timer = 0.0
             self._next_weather_change = self._rand_weather_interval()
-            # moisture pulse on rain
             if self.weather in ("rain", "storm", "blizzard"):
                 self.moisture = np.clip(self.moisture + 0.3, 0.0, 1.0)
             else:
                 self.moisture = np.clip(self.moisture - 0.05, 0.0, 1.0)
 
-        # ── object growth (Numba JIT) ─────────────────────────
         update_growth_kernel(self.obj_type, self.obj_growth, self.obj_rate,
                              self.terrain, sim_dt, self.season_idx)
 
-        # ── harvest cooldown ─────────────────────────────────
         mask = self.obj_harvest_cd > 0
         self.obj_harvest_cd[mask] -= sim_dt
 
-        # ── fire update (Numba JIT) ───────────────────────────
-        if self.season_idx != 3:  # no natural fire in winter
+        if self.season_idx != 3:
             fire_mult = np.float32(self.WEATHER_FIRE_MULT.get(self.weather, 1.0))
             update_fire_kernel(
                 self.fire_intensity.astype(np.float32),
@@ -404,12 +390,10 @@ class World:
                 np.float32(sim_dt), fire_mult,
                 self.rng_seeds
             )
-            # remove burned objects
             burned = (self.fire_intensity > 0) & (self.obj_type == O_TREE)
             self.obj_type[burned]   = O_NONE
             self.obj_growth[burned] = 0.0
 
-        # random summer lightning fire
         if self.season_idx == 1 and self.weather == "clear":
             if random.random() < 0.0001 * sim_dt:
                 trees = np.argwhere(self.obj_type == O_TREE)
@@ -436,7 +420,6 @@ class World:
         self.obj_growth[y, x] = 0.0
 
     def harvest(self, y, x):
-        """Returns item dict or None."""
         ot = self.obj_type[y, x]
         if ot == O_NONE: return None
         g  = self.obj_growth[y, x]
@@ -470,15 +453,44 @@ class World:
         items = self.dropped_items.pop(key, [])
         return items
 
+    # ── Spatial queries ───────────────────────────────────────
+
     def near_river(self, y, x, radius=1):
+        """
+        Return True if any tile within `radius` Manhattan steps is a river.
+        Accepts any radius so baby agents can drink from close-by water
+        without needing to path all the way to the river centre.
+        """
         H, W = WORLD_H, WORLD_W
-        for dy in range(-radius, radius+1):
-            for dx in range(-radius, radius+1):
-                ny, nx = int(y)+dy, int(x)+dx
+        iy, ix = int(y), int(x)
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                ny, nx = iy + dy, ix + dx
                 if 0 <= ny < H and 0 <= nx < W:
                     if self.terrain[ny, nx] == T_RIVER:
                         return True
         return False
+
+    def find_nearest_water_tile(self, y, x, radius=10):
+        """
+        Return the (ty, tx) of the closest river tile within `radius`,
+        or None if none found.  Used by baby agents to drink from nearby
+        water even without a full river search.
+        """
+        H, W = WORLD_H, WORLD_W
+        iy, ix = int(y), int(x)
+        best_d = 1e9
+        best = None
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                ny, nx = iy + dy, ix + dx
+                if 0 <= ny < H and 0 <= nx < W:
+                    if self.terrain[ny, nx] == T_RIVER:
+                        d = abs(dy) + abs(dx)
+                        if d < best_d:
+                            best_d = d
+                            best = (ny, nx)
+        return best
 
     def near_fire(self, y, x, radius=3):
         H, W = WORLD_H, WORLD_W
@@ -501,7 +513,6 @@ class World:
         return False
 
     def find_nearest(self, y, x, obj_type_val, radius=25):
-        """Find nearest object tile of given type within radius."""
         H, W = WORLD_H, WORLD_W
         iy, ix = int(y), int(x)
         best_d = 1e9
@@ -534,7 +545,6 @@ class World:
         return best
 
     def find_empty_ground(self, cy, cx, radius=5):
-        """Find an empty tile near (cy,cx) for building."""
         H, W = WORLD_H, WORLD_W
         for r in range(1, radius+1):
             for dy in range(-r, r+1):
