@@ -131,6 +131,14 @@ class Agent:
         else:
             self.weights = [1.0] * NUM_ACTIONS
 
+        # ── Exploration trait ─────────────────────────────────
+        # 0.0 = strong homebody (pulled hard toward familiar tiles)
+        # 1.0 = restless wanderer (home pull completely ignored)
+        # Survival actions (fire/thirst/hunger/cold) bypass this entirely.
+        self.exploration = 0.3
+        self.visit_heat  = {}   # (ty, tx) -> visit count
+        self._heat_timer = 0.0  # seconds between heat recordings
+
         self.event_log = []
         self.prev_vitals = (self.hunger, self.thirst, self.warmth, self.mood)
 
@@ -346,6 +354,19 @@ class Agent:
         else:
             self.alert_fire = False
 
+        # ── Record visit heatmap (every ~2 sim-seconds) ───────
+        self._heat_timer += sim_dt
+        if self._heat_timer >= 2.0:
+            self._heat_timer = 0.0
+            key = (int(self.y), int(self.x))
+            self.visit_heat[key] = self.visit_heat.get(key, 0) + 1
+            # Cap heat dict size so it doesn't grow unbounded
+            if len(self.visit_heat) > 400:
+                # Drop the coldest (least-visited) tiles
+                sorted_keys = sorted(self.visit_heat, key=lambda k: self.visit_heat[k])
+                for k in sorted_keys[:100]:
+                    del self.visit_heat[k]
+
         action = self.decide(world, agents)
         self.current_action = action
         speed = 2.0 if world.is_day else 1.2
@@ -511,27 +532,68 @@ class Agent:
         else:
             self._seek_food(world, sim_dt, speed, stockpile=True)
 
+    def _pickup_nearby_items(self, world, radius=2):
+        """Scavenge any dropped items within radius tiles before crafting."""
+        iy, ix = int(self.y), int(self.x)
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                ny, nx = iy + dy, ix + dx
+                if 0 <= ny < WORLD_H and 0 <= nx < WORLD_W:
+                    items = world.pick_dropped(ny, nx)
+                    for item in items:
+                        if self.inv_total_slots() < self.inv_limit:
+                            self.inv_add(
+                                item.get("type", "rock"),
+                                item.get("quantity", 1),
+                                item.get("freshness"),
+                            )
+                        else:
+                            world.drop_items(ny, nx, [item])
+
     def _craft(self, world, sim_dt):
+        """Craft items. Consumes materials and waits out the craft timer."""
+        # ── still busy crafting ───────────────────────────────
         if self.craft_remaining > 0:
             self.craft_remaining -= sim_dt
             if self.craft_remaining <= 0:
+                self.craft_remaining = 0.0
                 item = self.crafting_item
                 self.crafting_item = None
                 self.inv_add(item, 1)
                 self.record_event(A_CRAFT_TOOL, 1.0)
             return
 
-        for recipe in ("sharpened_stone", "axe", "hoe", "fireplace", "wooden_block", "bread"):
-            if recipe == "bread" and not world.near_structure(self.y, self.x, S_FIREPLACE, 3):
+        # ── already started a craft this frame (guard) ────────
+        if self.crafting_item is not None:
+            return
+
+        # Scoop up any items nearby before trying to craft
+        self._pickup_nearby_items(world, radius=2)
+
+        # Priority-ordered recipes. Skip tools already owned (no hoarding).
+        for recipe in ("bread", "fireplace", "axe", "hoe", "shovel",
+                       "sharpened_stone", "wooden_block"):
+            # bread only near a fireplace
+            if recipe == "bread" and not world.near_structure(
+                    self.y, self.x, S_FIREPLACE, 3):
+                continue
+            # Don't craft another axe/hoe/shovel if one is already in inventory
+            if recipe in ("axe", "hoe", "shovel") and self.has_tool(recipe):
+                continue
+            # Don't craft sharpened_stone if we already have one and no axe recipe yet
+            if recipe == "sharpened_stone" and self.inv_count("sharpened_stone") >= 2:
                 continue
             if self.has_recipe(recipe):
                 self.consume_recipe(recipe)
                 self.crafting_item = recipe
                 self.craft_remaining = CRAFT_TIME.get(recipe, 3.0)
                 return
+
+        # Nothing to craft — go gather materials instead
         self._seek_food(world, sim_dt, 1.0, stockpile=True)
 
     def _build(self, world, sim_dt):
+        """Build structures. Planks can be placed freely at any empty spot near agent."""
         if self.has_recipe("fireplace") and not world.near_structure(self.y, self.x, S_FIREPLACE, 6):
             spot = world.find_empty_ground(self.y, self.x, 4)
             if spot:
@@ -543,21 +605,30 @@ class Agent:
             return
 
         if self.inv_count("wooden_block") >= 2:
-            if self.home_y is None:
-                spot = world.find_empty_ground(self.y, self.x, 5)
+            # Agent chooses placement freely: near home if known, else current pos
+            if self.home_y is not None:
+                # extend existing home — place adjacent to home tile
+                spot = world.find_empty_ground(self.home_y, self.home_x, 3)
             else:
-                spot = (int(self.home_y), int(self.home_x))
+                # brand new home — place right where agent is standing
+                spot = world.find_empty_ground(self.y, self.x, 3)
             if spot:
-                self.inv_remove("wooden_block", 2)
-                world.place_structure(spot[0], spot[1], S_HOUSE)
-                self.home_y, self.home_x = spot
-                self.memory.setdefault("home", []).append(spot)
-                self.record_event(A_BUILD, 1.0)
+                # Move toward chosen spot
+                arrived = self._move_toward(spot[0], spot[1], world, sim_dt, 1.0)
+                if arrived:
+                    self.inv_remove("wooden_block", 2)
+                    world.place_structure(spot[0], spot[1], S_HOUSE)
+                    self.home_y, self.home_x = spot[0], spot[1]
+                    self.memory.setdefault("home", []).append(spot)
+                    self.record_event(A_BUILD, 1.5)
             return
 
+        # Craft a wooden block from wood in hand or nearby
+        self._pickup_nearby_items(world, radius=2)
         if self.has_recipe("wooden_block"):
             self.consume_recipe("wooden_block")
             self.inv_add("wooden_block", 1)
+            self.record_event(A_BUILD, 0.3)
         else:
             self._wander(world, sim_dt, 1.0)
 
@@ -591,17 +662,66 @@ class Agent:
             self._wander(world, sim_dt, speed)
 
     def _wander(self, world, sim_dt, speed):
-        if (
+        """
+        Wander behaviour shaped by exploration trait (0–1).
+
+        Low exploration  → agent is pulled toward its hottest (most-visited)
+                           tiles and picks short-range wander targets nearby.
+        High exploration → large random targets, home-pull ignored entirely.
+
+        Survival actions completely bypass this method, so thirst/hunger/fire
+        never interact with the exploration trait.
+        """
+        at_target = (
             self.target is None
-            or abs(self.x - self.target[1]) < 1
-            and abs(self.y - self.target[0]) < 1
-        ):
+            or (abs(self.x - self.target[1]) < 1 and abs(self.y - self.target[0]) < 1)
+        )
+
+        if at_target:
             home_y = self.home_y if self.home_y is not None else WORLD_H / 2
             home_x = self.home_x if self.home_x is not None else WORLD_W / 2
-            r = 15 if not world.is_day else 25
-            ty = max(0, min(WORLD_H - 1, home_y + random.uniform(-r, r)))
-            tx = max(0, min(WORLD_W - 1, home_x + random.uniform(-r, r)))
+
+            # Base wander radius scales with exploration (4 to 35 tiles)
+            r = 4.0 + self.exploration * 31.0
+
+            # Night-time restriction applies uniformly (safety)
+            if not world.is_day:
+                r *= 0.5
+
+            if self.exploration < 0.5 and self.visit_heat:
+                # --- Homebody: bias toward a warm (familiar) tile ----------
+                # Find the hottest tile within 2×r of home
+                best_key   = None
+                best_score = -1
+                cx, cy = home_x, home_y
+                for (ky, kx), heat in self.visit_heat.items():
+                    dist_from_home = abs(ky - home_y) + abs(kx - home_x)
+                    if dist_from_home > r * 2:
+                        continue
+                    # Score: heat × (1 - how far it is / max range)
+                    score = heat * (1.0 - dist_from_home / max(r * 2, 1))
+                    if score > best_score:
+                        best_score = score
+                        best_key   = (ky, kx)
+
+                if best_key and best_score > 0:
+                    # Add small jitter so they don't freeze on one spot
+                    jitter = 3.0 * (1.0 - self.exploration)
+                    ty = _clamp(best_key[0] + random.uniform(-jitter, jitter),
+                                0, WORLD_H - 1)
+                    tx = _clamp(best_key[1] + random.uniform(-jitter, jitter),
+                                0, WORLD_W - 1)
+                else:
+                    # No heat data yet — stay close to home
+                    ty = _clamp(home_y + random.uniform(-r * 0.4, r * 0.4), 0, WORLD_H - 1)
+                    tx = _clamp(home_x + random.uniform(-r * 0.4, r * 0.4), 0, WORLD_W - 1)
+            else:
+                # --- Explorer: random target within full radius --------------
+                ty = _clamp(home_y + random.uniform(-r, r), 0, WORLD_H - 1)
+                tx = _clamp(home_x + random.uniform(-r, r), 0, WORLD_W - 1)
+
             self.target = (ty, tx)
+
         self._move_toward(self.target[0], self.target[1], world, sim_dt, speed * 0.6)
 
     def _loot_ground(self, world):
@@ -637,6 +757,12 @@ class Agent:
         for k, v in self.memory.items():
             child.memory[k] = v[: int(len(v) * KNOWLEDGE_INHERIT)]
 
+        # Pass on a fraction of the parent's heatmap (familiar ground)
+        if self.visit_heat:
+            sorted_heat = sorted(self.visit_heat.items(), key=lambda kv: -kv[1])
+            inherited   = sorted_heat[:int(len(sorted_heat) * KNOWLEDGE_INHERIT)]
+            child.visit_heat = dict(inherited)
+
         partner = next((a for a in agents if a.id == self.partner_id), None)
         if partner:
             child.weights = [
@@ -651,11 +777,20 @@ class Agent:
                 )
                 for i in range(NUM_ACTIONS)
             ]
+            # Exploration trait: average parents + mutation, clamped 0–1
+            child.exploration = max(0.0, min(1.0,
+                self.exploration * 0.5
+                + partner.exploration * 0.5
+                + random.gauss(0, 0.05)
+            ))
         else:
             child.weights = [
                 max(0.3, min(3.0, w + random.gauss(0, MUTATION_RATE)))
                 for w in self.weights
             ]
+            child.exploration = max(0.0, min(1.0,
+                self.exploration + random.gauss(0, 0.05)
+            ))
 
         if self.inv_count("berry") > 1:
             self.inv_remove("berry", 1)
