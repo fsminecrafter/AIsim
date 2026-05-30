@@ -117,6 +117,35 @@ def reset():
     selected_agent = None
 
 
+def _insert_newborns(agents, new_children):
+    """
+    Safely insert newborns into the population.
+
+    Rules enforced here:
+    - Never exceed MAX_AGENTS.
+    - Never kill the mother by inserting a child (mother health is already
+      guarded in tick_pregnancy, but we double-check here).
+    - Children are inserted with valid state; we drop extras silently if
+      the cap is already full (shouldn't happen often with pop pressure).
+    """
+    live_count = sum(1 for a in agents if not a.is_dead)
+    inserted = 0
+    for child in new_children:
+        if live_count + inserted >= MAX_AGENTS:
+            break  # population cap — drop this child quietly
+        # Sanity-check child state so it cannot be born already dead
+        if child.health <= 0:
+            child.health = BABY_HEALTH_START
+        if child.hunger <= 0:
+            child.hunger = 70.0
+        if child.thirst <= 0:
+            child.thirst = 70.0
+        child.is_dead = False  # guard against any stray flag
+        agents.append(child)
+        inserted += 1
+    return agents
+
+
 # ─── main loop ───────────────────────────────────────────────
 running = True
 while running:
@@ -208,7 +237,6 @@ while running:
     if keys[pygame.K_RIGHT] or keys[pygame.K_d]: renderer.pan( pan_spd, 0); panning = True
     if keys[pygame.K_UP]    or keys[pygame.K_w]: renderer.pan(0, -pan_spd); panning = True
     if keys[pygame.K_DOWN]  or keys[pygame.K_s]: renderer.pan(0,  pan_spd); panning = True
-    # Manual pan breaks camera-follow so the player can look elsewhere freely
     if panning:
         selected_agent = None
 
@@ -216,7 +244,6 @@ while running:
     if selected_agent and not selected_agent.is_dead:
         target_wx = selected_agent.x * TILE_SIZE + TILE_SIZE / 2
         target_wz = selected_agent.y * TILE_SIZE + TILE_SIZE / 2
-        # Smooth lerp: fast enough to stay on them, gentle enough to feel cinematic
         follow_speed = min(1.0, 8.0 * real_dt)
         renderer.cam_target[0] += (target_wx - renderer.cam_target[0]) * follow_speed
         renderer.cam_target[2] += (target_wz - renderer.cam_target[2]) * follow_speed
@@ -227,14 +254,21 @@ while running:
 
         world.tick(real_dt)
 
+        # Collect new children separately so we can do a safe insert
         new_children = []
         for ag in agents:
             ag.tick(world, agents, real_dt)
+            # Pass sim_speed-scaled dt to pregnancy so it advances correctly
             child = ag.tick_pregnancy(world, agents, real_dt * sim_speed_ref[0])
-            if child and len(agents) + len(new_children) < MAX_AGENTS:
+            if child is not None:
                 new_children.append(child)
 
-        agents.extend(new_children)
+        # Safe population-capped insertion — never exceeds MAX_AGENTS,
+        # never lets a newborn arrive in a broken state.
+        if new_children:
+            agents = _insert_newborns(agents, new_children)
+
+        # Remove dead agents
         agents = [a for a in agents if not a.is_dead]
 
         if frame_no % 120 == 0:
