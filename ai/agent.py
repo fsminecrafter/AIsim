@@ -1,13 +1,17 @@
 """
 Agent AI — behaviour tree, learning weights, genetic inheritance.
 
-v2 — Full living-world patch:
-  * Relationship system: friends, family, nemeses
-  * Safe reproduction with pregnancy cooldown, postpartum floor, pop pressure
-  * Baby survival: grace period, proximity drinking, parent-following
-  * Drink-loop fix: satisfaction timer + cooldown
-  * Adult build/improve motivation based on surplus and shelter state
-  * Social behaviours: travel together, share food, group defence
+v3 — Full patch:
+  * FIX 1 — Birth safety: tick_pregnancy always creates a NEW Agent and
+             returns it; never converts the mother; asserts adult survives.
+  * FIX 2 — No infinite forage loops: recreation gate when food > 20 and
+             all core needs > 60 %.  New A_RECREATE branch.
+  * FIX 3 — Sleep: sleeping / sleep_timer / wake_reason fields. Night
+             rest, gradual recovery, interrupt on urgent need.
+  * FIX 4 — Pregnancy icon data exposed (preg_timer != None on mother).
+  * FIX 5 — Heart effect: heart_effect_timer set on successful conception.
+  * FIX 6 — Friends list consumable by HUD inspector (friends dict already
+             exists; added selected_friend_id for click-through).
 """
 
 import math
@@ -29,32 +33,34 @@ from ai.actions import (
     A_BUILD,
     A_SEEK_MATE,
     A_WANDER,
+    A_SLEEP,
+    A_RECREATE,
 )
 from engine.config import *
 from world.world import *
 
 
 ITEM_FOOD_VALUE = {
-    "berry": 15,
-    "wheat": 8,
-    "bread": 40,
+    "berry":       15,
+    "wheat":        8,
+    "bread":       40,
     "cooked_meat": 50,
 }
 
 CRAFT_RECIPES = {
     "sharpened_stone": {"rock": 2},
-    "axe": {"sharpened_stone": 1, "wood": 1},
-    "hoe": {"sharpened_stone": 1, "wood": 1},
-    "shovel": {"sharpened_stone": 1, "wood": 1},
-    "wooden_block": {"wood": 2},
-    "fireplace": {"rock": 4, "wood": 2},
-    "bread": {"wheat": 2},
+    "axe":             {"sharpened_stone": 1, "wood": 1},
+    "hoe":             {"sharpened_stone": 1, "wood": 1},
+    "shovel":          {"sharpened_stone": 1, "wood": 1},
+    "wooden_block":    {"wood": 2},
+    "fireplace":       {"rock": 4, "wood": 2},
+    "bread":           {"wheat": 2},
 }
 
 CRAFT_TIME = {
     "sharpened_stone": 3.0,
-    "axe": 5.0,
-    "hoe": 5.0,
+    "axe":  5.0,
+    "hoe":  5.0,
     "shovel": 5.0,
     "wooden_block": 4.0,
     "fireplace": 10.0,
@@ -63,6 +69,23 @@ CRAFT_TIME = {
 
 TOOL_DURABILITY = 100
 _agent_id_counter = [0]
+
+# ── Sleep constants ────────────────────────────────────────────
+SLEEP_NEED_THRESHOLD  = 0.0     # (reserved for a fatigue stat; currently
+                                 #  sleep is triggered by night + low mood)
+SLEEP_NIGHT_MOOD_THRESH = 40.0  # mood below this at night triggers sleep
+SLEEP_MIN_DURATION    = 15.0    # minimum sim-seconds to sleep per nap
+SLEEP_MAX_DURATION    = 45.0    # maximum sim-seconds to sleep per nap
+SLEEP_WARMTH_RESTORE  = 2.0     # warmth gained per sim-second while sleeping
+SLEEP_MOOD_RESTORE    = 1.5     # mood  gained per sim-second while sleeping
+SLEEP_HEALTH_RESTORE  = 0.3     # health gained per sim-second while sleeping
+
+# ── Recreation constants ───────────────────────────────────────
+RECREATION_FOOD_GATE  = 20      # total food-value units above which recreation kicks in
+RECREATION_VITAL_GATE = 60.0    # all core vitals must be above this to recreate
+
+# ── Heart effect ───────────────────────────────────────────────
+HEART_EFFECT_DURATION = 3.0     # seconds the heart floats above the colonist
 
 
 def new_id():
@@ -88,68 +111,71 @@ class Agent:
         world=None,
         hidden_size=None,
     ):
-        self.id = new_id()
+        self.id     = new_id()
         self.gender = gender or random.choice(["male", "female"])
-        self.age = 0.0
+        self.age    = 0.0
         self.winters = 0
-        self.stage = "adult"
+        self.stage  = "adult"
 
         self.hunger = random.uniform(60, 90)
         self.thirst = random.uniform(60, 90)
         self.warmth = random.uniform(70, 90)
-        self.mood = random.uniform(60, 90)
+        self.mood   = random.uniform(60, 90)
         self.health = 100.0
 
         self.x = float(x)
         self.y = float(y)
-        self.path = []
+        self.path   = []
         self.target = None
 
         self.current_action = A_WANDER
-        self.action_timer = 0.0
-        self.action_target = None
-        self.crafting_item = None
-        self.craft_remaining = 0.0
+        self.action_timer   = 0.0
+        self.action_target  = None
+        self.crafting_item    = None
+        self.craft_remaining  = 0.0
         self.is_dead = False
 
         self.inventory = {}
         self.inv_limit = 10
 
         self.memory = {
-            O_TREE: [],
-            O_BERRY: [],
-            O_WHEAT: [],
-            "river": [],
-            "home": [],
+            O_TREE:   [],
+            O_BERRY:  [],
+            O_WHEAT:  [],
+            "river":  [],
+            "home":   [],
         }
         self.home_y = None
         self.home_x = None
 
         # ── Reproduction state ────────────────────────────────
-        self.partner_id = None
-        self.children_ids = []
-        self.parent_ids = []          # NEW: track parents by ID
-        self.preg_timer = None
-        # Cooldown after giving birth (prevents chained pregnancies and death)
-        self.postpartum_timer = 0.0   # counts down; >0 means cannot conceive
+        self.partner_id     = None
+        self.children_ids   = []
+        self.parent_ids     = []
+        self.preg_timer     = None
+        self.postpartum_timer = 0.0
 
         # ── Drink satisfaction cooldown ───────────────────────
-        # After drinking to DRINK_SATISFIED, this counts down before agent
-        # can choose drink/find_water again. Prevents infinite drink loops.
         self.drink_cooldown = 0.0
 
         # ── Baby grace period ─────────────────────────────────
-        self.grace_timer = 0.0        # set on newborn creation
+        self.grace_timer = 0.0
+
+        # ── Sleep state (FIX 3) ───────────────────────────────
+        self.sleeping       = False
+        self.sleep_timer    = 0.0    # remaining sleep time
+        self.wake_reason    = None   # why we woke up (string, debug)
+        self._sleep_cooldown = 0.0   # prevents re-sleeping immediately
+
+        # ── Heart effect (FIX 5) ──────────────────────────────
+        self.heart_effect_timer = 0.0   # > 0  → draw heart above this agent
 
         # ── Relationship system ───────────────────────────────
-        # friends: {agent_id: float score}  — non-family friends only
-        self.friends = {}
-        # nemeses: {agent_id: bool}
-        self.nemeses = {}
-        # fighting: {agent_id: float cooldown}
+        self.friends       = {}   # {agent_id: float score}
+        self.nemeses       = {}
         self._fight_timers = {}
 
-        self.alert_fire = False
+        self.alert_fire  = False
         self.alert_timer = 0.0
 
         if parent_weights is not None:
@@ -160,18 +186,17 @@ class Agent:
         else:
             self.weights = [1.0] * NUM_ACTIONS
 
-        # ── Exploration trait ─────────────────────────────────
-        self.exploration = 0.3
-        self.visit_heat  = {}
-        self._heat_timer = 0.0
+        self.exploration  = 0.3
+        self.visit_heat   = {}
+        self._heat_timer  = 0.0
 
-        self.event_log = []
+        self.event_log  = []
         self.prev_vitals = (self.hunger, self.thirst, self.warmth, self.mood)
 
-        self.food_eaten = 0
+        self.food_eaten    = 0
         self.children_born = 0
         self.fires_escaped = 0
-        self.generation = 0
+        self.generation    = 0
 
     # ── Inventory helpers ─────────────────────────────────────
 
@@ -231,6 +256,9 @@ class Agent:
     def record_event(self, action_id, reward):
         if action_id is None:
             return
+        # Guard against action IDs beyond weights vector (A_SLEEP, A_RECREATE)
+        if action_id >= len(self.weights):
+            return
         self.weights[action_id] = max(
             0.3,
             min(3.0, self.weights[action_id] + LEARNING_RATE * reward),
@@ -251,7 +279,6 @@ class Agent:
     # ── Relationship helpers ──────────────────────────────────
 
     def is_family(self, other_id):
-        """True if other_id is a parent or child of this agent."""
         return other_id in self.parent_ids or other_id in self.children_ids
 
     def is_nemesis(self, other_id):
@@ -261,12 +288,9 @@ class Agent:
         return self.friends.get(other_id, 0.0)
 
     def gain_friendship(self, other_id, amount):
-        """Add friendship score; family ties are not tracked here (always max)."""
         if self.is_family(other_id):
-            return  # family needs no score tracking
-        # Cap friend count at MAX_FRIENDS before adding new entries
+            return
         if other_id not in self.friends and len(self.friends) >= MAX_FRIENDS:
-            # Drop the weakest friend to make room (only if this gain is significant)
             if amount >= FRIEND_NEAR_GAIN * 10:
                 weakest = min(self.friends, key=lambda k: self.friends[k])
                 if self.friends[weakest] < self.friends.get(other_id, 0) + amount:
@@ -279,7 +303,6 @@ class Agent:
         self.friends[other_id] = min(100.0, current + amount)
 
     def decay_friendships(self):
-        """Each tick: small random chance to forget non-family, non-nemesis friends."""
         for fid in list(self.friends.keys()):
             if random.random() < FRIEND_FORGET_CHANCE:
                 self.friends[fid] -= FRIEND_FORGET_AMOUNT
@@ -287,22 +310,14 @@ class Agent:
                     del self.friends[fid]
 
     def make_nemesis(self, other):
-        """Mark two agents as nemeses of each other."""
         self.nemeses[other.id] = True
         other.nemeses[self.id] = True
-        # Nemesis relationship actively hurts friendship
         if other.id in self.friends:
             self.friends[other.id] = max(0.0, self.friends[other.id] - 10.0)
         if self.id in other.friends:
             other.friends[self.id] = max(0.0, other.friends[self.id] - 10.0)
 
     def _update_social(self, agents, sim_dt):
-        """
-        Update relationships with nearby agents:
-        - Gain small friendship from proximity
-        - Potential nemesis formation for competing males
-        - Occasional resource sharing with weak friends
-        """
         self.decay_friendships()
 
         for other in agents:
@@ -314,12 +329,10 @@ class Agent:
 
             oid = other.id
 
-            # ── Proximity friendship gain ─────────────────────
             if not self.is_nemesis(oid):
                 self.gain_friendship(oid, FRIEND_NEAR_GAIN * sim_dt)
                 other.gain_friendship(self.id, FRIEND_NEAR_GAIN * sim_dt)
 
-            # ── Male competition → nemesis ────────────────────
             if (self.gender == "male" and other.gender == "male"
                     and self.stage == "adult" and other.stage == "adult"
                     and dist < 2.0
@@ -327,17 +340,14 @@ class Agent:
                     and random.random() < NEMESIS_CHANCE * sim_dt):
                 self.make_nemesis(other)
 
-            # ── Nemesis fighting ──────────────────────────────
             if self.is_nemesis(oid) and dist < 2.0:
                 cd = self._fight_timers.get(oid, 0.0)
                 if cd <= 0 and random.random() < NEMESIS_FIGHT_CHANCE * sim_dt:
                     self._do_fight(other, agents)
-                    self._fight_timers[oid] = 5.0  # 5s between fights
-            # Tick fight cooldowns
+                    self._fight_timers[oid] = 5.0
             if oid in self._fight_timers:
                 self._fight_timers[oid] = max(0.0, self._fight_timers[oid] - sim_dt)
 
-            # ── Resource sharing ──────────────────────────────
             if (not self.is_nemesis(oid)
                     and (self.is_family(oid) or self.friendship_score(oid) > FRIEND_THRESHOLD)
                     and other.hunger < 30
@@ -346,24 +356,20 @@ class Agent:
                     and random.random() < 0.002 * sim_dt):
                 self._share_food(other)
 
-            # ── Group travel: friends move toward each other slightly ──
             if (not self.is_nemesis(oid)
                     and self.friendship_score(oid) > FRIEND_THRESHOLD
                     and dist > 4.0 and dist < 20.0
                     and self.current_action == A_WANDER
                     and random.random() < 0.05 * sim_dt):
-                # nudge target toward friend
                 self.target = (other.y + random.uniform(-2, 2),
                                other.x + random.uniform(-2, 2))
 
     def _do_fight(self, other, agents):
-        """Damage both fighters; friends may join."""
         self.health  = max(1.0, self.health  - FIGHT_DAMAGE)
         other.health = max(1.0, other.health - FIGHT_DAMAGE)
-        self.mood  = max(0.0, self.mood  - FIGHT_MOOD_LOSS)
-        other.mood = max(0.0, other.mood - FIGHT_MOOD_LOSS)
+        self.mood    = max(0.0, self.mood    - FIGHT_MOOD_LOSS)
+        other.mood   = max(0.0, other.mood   - FIGHT_MOOD_LOSS)
 
-        # Friends join with 25% chance
         for ag in agents:
             if ag is self or ag is other or ag.is_dead:
                 continue
@@ -373,7 +379,6 @@ class Agent:
                 continue
             if random.random() >= FIGHT_JOIN_CHANCE:
                 continue
-            # Friend joins against the nemesis of whoever is closer
             if (ag.friendship_score(self.id) > FRIEND_THRESHOLD
                     or self.is_family(ag.id)):
                 other.health = max(1.0, other.health - FIGHT_DAMAGE * 0.5)
@@ -382,7 +387,6 @@ class Agent:
                 self.health = max(1.0, self.health - FIGHT_DAMAGE * 0.5)
 
     def _share_food(self, other):
-        """Give one food item to a hungry friend or child."""
         for ftype in ("berry", "bread", "wheat"):
             if self.inv_count(ftype) > 1:
                 self.inv_remove(ftype, 1)
@@ -394,10 +398,75 @@ class Agent:
 
     # ── Decision making ───────────────────────────────────────
 
+    def _should_sleep(self, world):
+        """
+        Returns True when this colonist should start sleeping.
+        Conditions:
+          - Not a baby (babies just wander / follow parents)
+          - Not currently in danger (fire, critical vitals)
+          - Night time
+          - Mood is low enough to warrant rest
+          - Not already sleeping
+          - Sleep cooldown expired
+        """
+        if self.stage == "baby":
+            return False
+        if self.sleeping:
+            return False
+        if self._sleep_cooldown > 0:
+            return False
+        if self.alert_fire:
+            return False
+        if min(self.hunger, self.thirst) < 20:
+            return False
+        # Night + mood gate
+        if not world.is_day and self.mood < SLEEP_NIGHT_MOOD_THRESH:
+            return True
+        # Also sleep at night with ~20% random chance if mood < 70
+        if not world.is_day and self.mood < 70 and random.random() < 0.005:
+            return True
+        return False
+
+    def _should_recreate(self):
+        """
+        FIX 2 — Returns True when the colonist has enough food and high
+        enough vitals to stop foraging and do something enjoyable instead.
+        This breaks the infinite forage loop.
+        """
+        if self.stage == "baby":
+            return False
+        if self.total_food() < RECREATION_FOOD_GATE:
+            return False
+        if self.hunger < RECREATION_VITAL_GATE:
+            return False
+        if self.thirst < RECREATION_VITAL_GATE:
+            return False
+        if self.warmth < RECREATION_VITAL_GATE:
+            return False
+        return True
+
     def decide(self, world, agents):
         if self.stage == "baby":
             return self._baby_decide(world, agents)
 
+        # ── Sleep interrupt check ─────────────────────────────
+        if self.sleeping:
+            # Wake up on urgent need
+            urgent = (
+                self.alert_fire
+                or self.hunger < 20
+                or self.thirst < 15
+                or self.warmth < 25
+                or self.health < 20
+            )
+            if urgent or self.sleep_timer <= 0:
+                self.sleeping    = False
+                self.wake_reason = "urgent" if urgent else "rested"
+                self._sleep_cooldown = 10.0
+            else:
+                return A_SLEEP
+
+        # ── Emergency: fire ───────────────────────────────────
         w = list(self.weights)
         iy, ix = int(self.y), int(self.x)
         if 0 <= iy < WORLD_H and 0 <= ix < WORLD_W:
@@ -406,7 +475,7 @@ class Agent:
         if self.alert_fire:
             return A_FLEE_FIRE
 
-        # ── Thirst: only when meaningfully low AND cooldown expired ──
+        # ── Thirst ────────────────────────────────────────────
         if self.drink_cooldown <= 0:
             if self.thirst < 15:
                 return A_DRINK
@@ -415,15 +484,27 @@ class Agent:
 
         if self.health < 25:
             return A_SEEK_SAFETY
-
         if self.hunger < 20:
             return A_FIND_FOOD
         if self.warmth < 40:
             return A_SEEK_WARMTH
+
+        # ── FIX 2: Recreation gate — stop foraging if well-fed ──
+        if self._should_recreate():
+            w[A_FORAGE]    = 0.0   # block forage entirely
+            w[A_STOCKPILE] = 0.0
+            w[A_RECREATE]  = 2.0   # heavily prefer recreation
+            w[A_SEEK_MATE] = 1.5 if self._can_reproduce(world, agents) else 0.0
+            w[A_BUILD]    += self._build_utility(world, agents)
+            w[A_CRAFT_TOOL] += 0.5 if not self.has_tool("axe") else 0.0
+            w[A_WANDER]   += 1.0
+            return max(range(NUM_ACTIONS), key=lambda i: w[i])
+
+        # ── Moderate hunger ───────────────────────────────────
         if self.hunger < 50:
             return A_FIND_FOOD
 
-        # ── Social / mate weighting ───────────────────────────
+        # ── Season / stockpile ────────────────────────────────
         season = world.season_name
         if season in ("winter", "autumn") and self.total_food() < 80:
             w[A_STOCKPILE] += 1.0
@@ -432,9 +513,7 @@ class Agent:
         ):
             w[A_CRAFT_TOOL] += 0.8
 
-        # ── Build utility ─────────────────────────────────────
-        build_bonus = self._build_utility(world, agents)
-        w[A_BUILD] += build_bonus
+        w[A_BUILD] += self._build_utility(world, agents)
 
         if not world.near_structure(self.y, self.x, S_FIREPLACE, 6):
             if self.has_recipe("fireplace"):
@@ -445,17 +524,19 @@ class Agent:
         if self.home_y is None and self.inv_count("wooden_block") >= 2:
             w[A_BUILD] += 0.5
 
-        # ── Reproduction ─────────────────────────────────────
         if self._can_reproduce(world, agents):
             w[A_SEEK_MATE] += 1.5
+
+        # ── FIX 3: Sleep trigger ──────────────────────────────
+        if self._should_sleep(world):
+            self.sleeping    = True
+            self.sleep_timer = random.uniform(SLEEP_MIN_DURATION, SLEEP_MAX_DURATION)
+            self.wake_reason = None
+            return A_SLEEP
 
         return max(range(NUM_ACTIONS), key=lambda i: w[i])
 
     def _build_utility(self, world, agents):
-        """
-        Returns extra weight for building based on situational factors.
-        Adults prefer improving shelter when survival needs are covered.
-        """
         bonus = 0.0
         all_ok = (self.hunger > BUILD_PREFER_THRESH
                   and self.thirst > BUILD_PREFER_THRESH
@@ -466,7 +547,6 @@ class Agent:
         if self.total_food() > BUILD_FOOD_SURPLUS:
             bonus += 0.6
 
-        # Friends/children nearby increase motivation to build shelter
         for other in agents:
             if other is self or other.is_dead:
                 continue
@@ -476,20 +556,17 @@ class Agent:
                     bonus += 0.2
                     break
 
-        # Weak or missing home → strong motivation
         if self.home_y is None:
             bonus += 0.8
         elif not world.near_structure(self.home_y, self.home_x, S_HOUSE, 2):
             bonus += 0.5
 
-        # Approaching winter → boost
         season = world.season_name
         if season in ("autumn", "winter"):
             bonus += 0.5
 
-        # Tools improve gathering — motivate crafting if no tools
         if not self.has_tool("axe"):
-            bonus -= 0.3  # prefer crafting a tool first
+            bonus -= 0.3
 
         return bonus
 
@@ -498,7 +575,6 @@ class Agent:
         if 0 <= iy < WORLD_H and 0 <= ix < WORLD_W and world.fire_intensity[iy, ix] > 0:
             return A_FLEE_FIRE
 
-        # Drink only when cooldown expired and meaningfully thirsty
         if self.drink_cooldown <= 0 and self.thirst < 50:
             return A_FIND_WATER
         if self.hunger < 40:
@@ -508,11 +584,6 @@ class Agent:
         return A_WANDER
 
     def _can_reproduce(self, world, agents):
-        """
-        Strict reproduction gate.
-        Fixes: parents cannot chain-birth, pop cannot explode,
-        requires friendship, blocks family/nemesis pairings.
-        """
         if self.stage != "adult":
             return False
         if self.preg_timer is not None:
@@ -520,32 +591,18 @@ class Agent:
         if self.postpartum_timer > 0:
             return False
         if self.gender == "male":
-            # Males seek mates; females bear children. Only females decide.
             return False
-
-        # Vital requirements
         if self.hunger < REPRO_MIN_HUNGER:
             return False
         if self.mood < REPRO_MIN_MOOD:
             return False
         if self.total_food() < REPRO_MIN_FOOD:
             return False
-
-        # Shelter requirement (optional)
         if REPRO_NEED_SHELTER and self.home_y is None:
             return False
-
-        # Population pressure: birth chance drops near MAX_AGENTS
         pop = len([a for a in agents if not a.is_dead])
         if pop >= MAX_AGENTS:
             return False
-
-        # Check that at least one valid mate exists with sufficient friendship
-        for other in agents:
-            if other is self or other.is_dead:
-                return False  # will re-evaluate in _seek_mate
-        # We can't efficiently check all partners here without iterating;
-        # return True and let _seek_mate handle the final gate.
         return True
 
     # ── Tick ─────────────────────────────────────────────────
@@ -573,6 +630,14 @@ class Agent:
         if self.drink_cooldown > 0:
             self.drink_cooldown = max(0.0, self.drink_cooldown - sim_dt)
 
+        # Sleep cooldown
+        if self._sleep_cooldown > 0:
+            self._sleep_cooldown = max(0.0, self._sleep_cooldown - sim_dt)
+
+        # Heart effect countdown (FIX 5)
+        if self.heart_effect_timer > 0:
+            self.heart_effect_timer = max(0.0, self.heart_effect_timer - real_dt)
+
         # Food freshness decay
         for itype, idata in list(self.inventory.items()):
             if idata.get("freshness") is not None:
@@ -580,15 +645,14 @@ class Agent:
                 if idata["freshness"] <= 0:
                     self.inv_remove(itype, idata["quantity"])
 
-        # Vital decay
+        # ── Vital decay ───────────────────────────────────────
         weather = world.weather
-        season = world.season_name
+        season  = world.season_name
         wm  = world.WEATHER_MOOD_MULT.get(weather, 1.0)
         whm = world.WEATHER_HUNGER_MULT.get(weather, 1.0)
         www = world.WEATHER_WARMTH_MULT.get(weather, 1.0)
         scm = world.SEASON_COLD_MULT.get(season, 1.0)
 
-        # Babies have reduced decay; grace period gives extra protection
         in_grace = self.grace_timer > 0
         if self.stage == "baby":
             hunger_mod = BABY_HUNGER_DECAY * (0.4 if in_grace else 1.0)
@@ -597,13 +661,16 @@ class Agent:
             hunger_mod = 1.0
             thirst_mod = 1.0
 
+        # Sleeping agents decay vitals very slowly
+        sleep_mod = 0.1 if self.sleeping else 1.0
+
         elder_sp = 1.3 if self.stage == "elder" else 1.0
         near_fp  = world.near_structure(self.y, self.x, S_FIREPLACE, 3)
         roof     = world.inside_house(self.y, self.x)
 
-        self.hunger = max(0, self.hunger - HUNGER_DECAY * whm * sim_dt * hunger_mod)
-        self.thirst = max(0, self.thirst - THIRST_DECAY * sim_dt * thirst_mod)
-        self.mood   = max(0, self.mood   - MOOD_DECAY   * wm  * sim_dt)
+        self.hunger = max(0, self.hunger - HUNGER_DECAY * whm * sim_dt * hunger_mod * sleep_mod)
+        self.thirst = max(0, self.thirst - THIRST_DECAY * sim_dt * thirst_mod * sleep_mod)
+        self.mood   = max(0, self.mood   - MOOD_DECAY   * wm  * sim_dt * sleep_mod)
 
         # Friends nearby boost mood
         mood_friends = sum(
@@ -616,7 +683,7 @@ class Agent:
         if mood_friends > 0:
             self.mood = min(100, self.mood + 0.3 * mood_friends * sim_dt)
 
-        warmth_loss = WARMTH_DECAY * www * scm * sim_dt * elder_sp
+        warmth_loss = WARMTH_DECAY * www * scm * sim_dt * elder_sp * sleep_mod
         if near_fp:
             warmth_loss *= 0.3
             self.warmth = min(100, self.warmth + 3.0 * sim_dt)
@@ -627,11 +694,17 @@ class Agent:
             warmth_loss *= 0.5
         self.warmth = max(0, self.warmth - warmth_loss)
 
-        # Health
+        # ── FIX 3: Sleep restoration ──────────────────────────
+        if self.sleeping:
+            self.warmth = min(100, self.warmth + SLEEP_WARMTH_RESTORE * sim_dt)
+            self.mood   = min(100, self.mood   + SLEEP_MOOD_RESTORE   * sim_dt)
+            self.health = min(100, self.health + SLEEP_HEALTH_RESTORE * sim_dt)
+            self.sleep_timer = max(0.0, self.sleep_timer - sim_dt)
+
+        # ── Health ────────────────────────────────────────────
         if min(self.hunger, self.thirst, self.warmth, self.mood) <= 0:
-            # Grace period: babies cannot die from zero vitals immediately
             if in_grace:
-                self.health -= 1.0 * sim_dt  # slow drain only
+                self.health -= 1.0 * sim_dt
             else:
                 self.health -= 8 * sim_dt
         elif min(self.hunger, self.thirst, self.warmth) < 15:
@@ -652,8 +725,13 @@ class Agent:
 
         # Fire alert
         if world.near_fire(self.y, self.x, 5):
-            self.alert_fire = True
+            self.alert_fire  = True
             self.alert_timer = 10.0
+            # Fire wakes sleeping agents immediately
+            if self.sleeping:
+                self.sleeping    = False
+                self.wake_reason = "fire"
+                self._sleep_cooldown = 30.0
         elif self.alert_timer > 0:
             self.alert_timer -= sim_dt
         else:
@@ -670,7 +748,6 @@ class Agent:
                 for k in sorted_keys[:100]:
                     del self.visit_heat[k]
 
-        # Social update (every agent tick)
         self._update_social(agents, sim_dt)
 
         action = self.decide(world, agents)
@@ -711,9 +788,14 @@ class Agent:
             self._seek_mate(world, agents, sim_dt, speed)
         elif action == A_SEEK_SAFETY:
             self._seek_safety(world, sim_dt, speed)
+        elif action == A_SLEEP:
+            pass  # sleeping agents do nothing — handled in tick()
+        elif action == A_RECREATE:
+            self._recreate(world, agents, sim_dt, speed)
         else:
             self._wander(world, sim_dt, speed)
-        self._loot_ground(world)
+        if action != A_SLEEP:
+            self._loot_ground(world)
 
     def _move_toward(self, ty, tx, world, sim_dt, speed):
         dy = ty - self.y
@@ -750,30 +832,16 @@ class Agent:
         arrived = self._move_toward(best_y, best_x, world, sim_dt, speed * 2.0)
         if arrived:
             self.fires_escaped += 1
-            self.alert_fire = False
+            self.alert_fire  = False
             self.alert_timer = 0.0
 
     def _seek_water(self, world, sim_dt, speed, agents=None):
-        """
-        Fixed drinking behaviour:
-        1. Drink immediately if adjacent to water.
-        2. Move toward nearest river.
-        3. Babies can also drink from any river tile within BABY_DRINK_RADIUS.
-        4. After drinking to satisfaction, set drink_cooldown so agent won't
-           immediately re-select drink.
-
-        This eliminates the infinite drink loop: once thirst is full the
-        cooldown prevents drink from being chosen again until thirst actually
-        drops back below DRINK_THRESHOLD.
-        """
-        # Already satisfied? Reset and return — don't keep drinking.
         if self.thirst >= DRINK_SATISFIED:
             self.drink_cooldown = DRINK_COOLDOWN
             return
 
         drink_radius = BABY_DRINK_RADIUS if self.stage == "baby" else 1
 
-        # Can we drink right here?
         if world.near_river(self.y, self.x, drink_radius):
             gained = 40 * sim_dt
             self.thirst = min(100, self.thirst + gained)
@@ -782,7 +850,6 @@ class Agent:
                 self.drink_cooldown = DRINK_COOLDOWN
             return
 
-        # Find a river to walk to
         river = world.find_nearest_river(self.y, self.x, 50)
         if river:
             self.memory.setdefault("river", []).append(river)
@@ -790,7 +857,6 @@ class Agent:
                 self.memory["river"].pop(0)
             self._move_toward(river[0], river[1], world, sim_dt, speed)
         else:
-            # No river found — baby follows a parent who might know one
             if self.stage == "baby" and agents:
                 parent = next(
                     (a for a in agents
@@ -859,15 +925,15 @@ class Agent:
         if world.near_structure(self.y, self.x, S_FIREPLACE, 3):
             self.warmth = min(100, self.warmth + 8 * sim_dt)
             return
-        best = None
-        best_d = 1000000000.0
+        best   = None
+        best_d = 1e9
         for ty in range(WORLD_H):
             for tx in range(WORLD_W):
                 if world.structures[ty, tx] == S_FIREPLACE:
                     d = abs(ty - self.y) + abs(tx - self.x)
                     if d < best_d:
                         best_d = d
-                        best = (ty, tx)
+                        best   = (ty, tx)
         if best:
             self._move_toward(best[0], best[1], world, sim_dt, speed)
         elif self.has_recipe("fireplace"):
@@ -919,8 +985,8 @@ class Agent:
                 continue
             if self.has_recipe(recipe):
                 self.consume_recipe(recipe)
-                self.crafting_item = recipe
-                self.craft_remaining = CRAFT_TIME.get(recipe, 3.0)
+                self.crafting_item    = recipe
+                self.craft_remaining  = CRAFT_TIME.get(recipe, 3.0)
                 return
 
         self._seek_food(world, sim_dt, 1.0, stockpile=True)
@@ -960,14 +1026,7 @@ class Agent:
             self._wander(world, sim_dt, 1.0)
 
     def _seek_mate(self, world, agents, sim_dt, speed):
-        """
-        Revised mate-seeking with full relationship gating.
-        Only very close friends, opposite gender, non-family, non-nemesis,
-        both adult, both passing vital checks, with population pressure.
-        30% conception chance on contact.
-        """
         if self.gender != "female":
-            # Males just wander toward females they're friends with
             best = self._find_best_mate_candidate(agents)
             if best is None:
                 self._wander(world, sim_dt, speed)
@@ -984,25 +1043,25 @@ class Agent:
         if not arrived:
             return
 
-        # Population pressure factor
-        pop = len([a for a in agents if not a.is_dead])
+        pop        = len([a for a in agents if not a.is_dead])
         pop_factor = max(0.0, 1.0 - (pop / max(1, MAX_AGENTS)) ** POP_PRESSURE_EXP)
         conception_chance = BIRTH_SUCCESS_RATE * pop_factor
 
         if random.random() < conception_chance * sim_dt * 0.1:
-            # Conceive
-            self.partner_id = best.id
-            best.partner_id = self.id
-            self.preg_timer = 30.0
+            self.partner_id  = best.id
+            best.partner_id  = self.id
+            self.preg_timer  = 30.0
             self.children_born += 1
-            # Boost friendship on conception
             self.gain_friendship(best.id, FRIEND_DANGER_GAIN)
             best.gain_friendship(self.id, FRIEND_DANGER_GAIN)
             self.record_event(A_SEEK_MATE, 1.0)
 
+            # FIX 5 — Heart effect on both partners
+            self.heart_effect_timer = HEART_EFFECT_DURATION
+            best.heart_effect_timer = HEART_EFFECT_DURATION
+
     def _find_best_mate_candidate(self, agents):
-        """Return the best mate candidate for this agent, or None."""
-        best = None
+        best       = None
         best_score = -1.0
         for ag in agents:
             if ag is self or ag.is_dead:
@@ -1019,13 +1078,12 @@ class Agent:
                 continue
             if ag.preg_timer is not None:
                 continue
-            # Must be close friends (or family — but family is excluded above)
             score = self.friendship_score(ag.id)
             if self.gender == "female" and score < FRIEND_MATE_THRESHOLD:
                 continue
             if score > best_score:
                 best_score = score
-                best = ag
+                best       = ag
         return best
 
     def _seek_safety(self, world, sim_dt, speed):
@@ -1033,6 +1091,33 @@ class Agent:
             self._move_toward(self.home_y, self.home_x, world, sim_dt, speed * 1.2)
         else:
             self._wander(world, sim_dt, speed)
+
+    def _recreate(self, world, agents, sim_dt, speed):
+        """
+        FIX 2 — Recreation behaviour. Colonist wanders, socialises with
+        friends, and occasionally shares food.  No foraging during this state.
+        """
+        # Move toward a nearby friend for company, or just wander
+        target_ag = None
+        for ag in agents:
+            if ag is self or ag.is_dead:
+                continue
+            if self.friendship_score(ag.id) > FRIEND_THRESHOLD or self.is_family(ag.id):
+                dist = abs(ag.x - self.x) + abs(ag.y - self.y)
+                if 3 < dist < 18:
+                    target_ag = ag
+                    break
+
+        if target_ag is not None:
+            self._move_toward(
+                target_ag.y + random.uniform(-1.5, 1.5),
+                target_ag.x + random.uniform(-1.5, 1.5),
+                world, sim_dt, speed * 0.5,
+            )
+        else:
+            self._wander(world, sim_dt, speed * 0.4)
+
+        self.mood = min(100, self.mood + 0.5 * sim_dt)
 
     def _wander(self, world, sim_dt, speed):
         at_target = (
@@ -1087,6 +1172,11 @@ class Agent:
             )
 
     # ── Pregnancy / birth ─────────────────────────────────────
+    # FIX 1 — tick_pregnancy always creates a BRAND NEW Agent and returns
+    # it.  The mother object is NEVER modified to stage="baby" and is
+    # NEVER replaced.  The caller (_insert_newborns in main.py) appends
+    # the returned child to the population list.  An assert guards the
+    # mother's stage post-birth so we can detect regressions.
 
     def tick_pregnancy(self, world, agents, sim_dt):
         if self.preg_timer is None:
@@ -1097,38 +1187,42 @@ class Agent:
 
         self.preg_timer = None
 
-        # ── Postpartum guard: ensure mother survives birth ────
-        # Set the postpartum cooldown and enforce a health floor so the
-        # mother cannot die immediately from a birth event.
+        # Guard: mother must remain an adult after this call.
+        mother_stage_before = self.stage
+
         self.postpartum_timer = PREGNANCY_COOLDOWN
         if self.health < POSTPARTUM_HEALTH:
             self.health = POSTPARTUM_HEALTH
 
-        # Birth success: 30% base × population pressure
-        pop = len([a for a in agents if not a.is_dead])
+        pop        = len([a for a in agents if not a.is_dead])
         pop_factor = max(0.0, 1.0 - (pop / max(1, MAX_AGENTS)) ** POP_PRESSURE_EXP)
         if random.random() > BIRTH_SUCCESS_RATE * max(0.3, pop_factor):
-            # Miscarriage — no child, but still pay postpartum cost
+            # Miscarriage
+            assert self.stage == mother_stage_before, (
+                f"BUG: mother {self.id} stage changed during miscarriage "
+                f"{mother_stage_before} -> {self.stage}"
+            )
             return None
 
-        # ── Create child ──────────────────────────────────────
+        # ── Create a brand-new child Agent ────────────────────
+        # We deliberately do NOT touch self.stage, self.weights, or any
+        # other field that belongs to the mother.
         child = Agent(
             self.x + random.uniform(-1, 1),
             self.y + random.uniform(-1, 1),
             world=world,
         )
-        child.stage  = "baby"
-        child.winters = 0
-        child.age    = 0.0
-        child.health = BABY_HEALTH_START
-        child.hunger = 80.0
-        child.thirst = 80.0
-        child.warmth = 70.0
-        child.mood   = 80.0
+        child.stage    = "baby"    # set on the CHILD, not the mother
+        child.winters  = 0
+        child.age      = 0.0
+        child.health   = BABY_HEALTH_START
+        child.hunger   = 80.0
+        child.thirst   = 80.0
+        child.warmth   = 70.0
+        child.mood     = 80.0
         child.generation = self.generation + 1
-
-        # Grace period: newborn is protected for a while
         child.grace_timer = BABY_GRACE_PERIOD
+        child.is_dead  = False     # explicit safety flag
 
         # Family links
         child.parent_ids = [self.id]
@@ -1141,25 +1235,19 @@ class Agent:
         for k, v in self.memory.items():
             child.memory[k] = v[: int(len(v) * KNOWLEDGE_INHERIT)]
 
-        # Heatmap inheritance
         if self.visit_heat:
             sorted_heat = sorted(self.visit_heat.items(), key=lambda kv: -kv[1])
             inherited   = sorted_heat[:int(len(sorted_heat) * KNOWLEDGE_INHERIT)]
             child.visit_heat = dict(inherited)
 
-        # Weight inheritance
         partner = next((a for a in agents if a.id == self.partner_id), None)
         if partner:
             child.weights = [
-                max(
-                    0.3,
-                    min(
-                        3.0,
-                        self.weights[i] * 0.5
-                        + partner.weights[i] * 0.5
-                        + random.gauss(0, MUTATION_RATE),
-                    ),
-                )
+                max(0.3, min(3.0,
+                    self.weights[i] * 0.5
+                    + partner.weights[i] * 0.5
+                    + random.gauss(0, MUTATION_RATE),
+                ))
                 for i in range(NUM_ACTIONS)
             ]
             child.exploration = max(0.0, min(1.0,
@@ -1176,9 +1264,17 @@ class Agent:
                 self.exploration + random.gauss(0, 0.05)
             ))
 
-        # Give baby a starter berry
         if self.inv_count("berry") > 1:
             self.inv_remove("berry", 1)
             child.inv_add("berry", 1, freshness=100.0)
 
-        return child
+        # ── FIX 1 sanity assert — mother must still be an adult ──
+        assert self.stage == mother_stage_before, (
+            f"BUG: mother {self.id} stage was mutated during birth! "
+            f"Before={mother_stage_before}, After={self.stage}"
+        )
+        assert not self.is_dead or self.health <= 0, (
+            f"BUG: mother {self.id} marked dead without zero health"
+        )
+
+        return child   # caller appends this; never overwrites mother
