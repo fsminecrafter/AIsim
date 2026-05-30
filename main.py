@@ -5,6 +5,10 @@ SURVIVAL SIMULATION — 3D GPU Edition
 Full 3D perspective rendering with OpenGL 3.3 core via ModernGL.
 Agents: capsules. Trees: cylinders + sphere canopy. Rocks: spheres.
 Logs/planks: box meshes. Terrain heightmap. Weather particles.
+
+v3 — FIX 1: birth sanity checks + population logging.
+           FIX 6: friend-click selection wired from HUD return value.
+           FIX 3/4/5: draw_agent_icons called each frame.
 """
 
 import sys, os
@@ -17,7 +21,7 @@ import moderngl
 
 from engine.config import *
 from engine.renderer import Renderer
-from engine.hud import draw_hud, draw_colonist_panel
+from engine.hud import draw_hud, draw_colonist_panel, draw_agent_icons
 from world.world import World
 from ai.agent import Agent
 from engine.menu import run_menu
@@ -34,7 +38,7 @@ import engine.config as cfg
 cfg.INITIAL_AGENTS = menu_settings["population"]
 
 pygame.display.set_caption("Survival Simulation — 3D GPU Edition")
-flags = pygame.DOUBLEBUF | pygame.OPENGL | pygame.RESIZABLE
+flags  = pygame.DOUBLEBUF | pygame.OPENGL | pygame.RESIZABLE
 screen = pygame.display.set_mode((SCREEN_W, SCREEN_H), flags)
 
 ctx = moderngl.create_context()
@@ -75,6 +79,7 @@ if hasattr(world, "enable_seasons"):
 agents   = []
 renderer = Renderer(ctx, SCREEN_W, SCREEN_H)
 
+
 def _spawn_agents(n):
     result = []
     for _ in range(n):
@@ -89,6 +94,7 @@ def _spawn_agents(n):
         result.append(a)
     return result
 
+
 agents = _spawn_agents(cfg.INITIAL_AGENTS)
 pop_history    = [len(agents)]
 selected_agent = None
@@ -99,7 +105,6 @@ clock     = pygame.time.Clock()
 last_time = time.perf_counter()
 frame_no  = 0
 
-# Camera orbit mouse drag
 _drag_active = False
 _drag_last   = (0, 0)
 
@@ -111,7 +116,7 @@ def reset():
     if hasattr(world, "enable_seasons"):
         world.enable_seasons = menu_settings["seasons"]
         world.current_season = menu_settings["start_season"]
-    renderer._height_map = None   # rebuild height cache
+    renderer._height_map = None
     agents = _spawn_agents(cfg.INITIAL_AGENTS)
     pop_history    = [len(agents)]
     selected_agent = None
@@ -119,31 +124,57 @@ def reset():
 
 def _insert_newborns(agents, new_children):
     """
-    Safely insert newborns into the population.
+    FIX 1 — Safely insert newborns into the population.
 
     Rules enforced here:
+    - The child is a brand-new Agent instance (never the mother).
     - Never exceed MAX_AGENTS.
-    - Never kill the mother by inserting a child (mother health is already
-      guarded in tick_pregnancy, but we double-check here).
-    - Children are inserted with valid state; we drop extras silently if
-      the cap is already full (shouldn't happen often with pop pressure).
+    - Children are appended; no existing entry is overwritten.
+    - Logs births and detects if parent count shrank (regression guard).
     """
-    live_count = sum(1 for a in agents if not a.is_dead)
-    inserted = 0
+    live_before = sum(1 for a in agents if not a.is_dead)
+    inserted    = 0
+
     for child in new_children:
-        if live_count + inserted >= MAX_AGENTS:
-            break  # population cap — drop this child quietly
-        # Sanity-check child state so it cannot be born already dead
+        if live_before + inserted >= MAX_AGENTS:
+            break
+
+        # FIX 1 — sanity: child must be a distinct object not already in list
+        already_in = any(a is child for a in agents)
+        if already_in:
+            print(f"[BUG] tick_pregnancy returned an agent already in the list: {child.id}")
+            continue
+
+        # Ensure valid starting state
         if child.health <= 0:
             child.health = BABY_HEALTH_START
         if child.hunger <= 0:
             child.hunger = 70.0
         if child.thirst <= 0:
             child.thirst = 70.0
-        child.is_dead = False  # guard against any stray flag
-        agents.append(child)
+        child.is_dead = False
+
+        agents.append(child)   # APPEND — never overwrite
         inserted += 1
+
+    live_after = sum(1 for a in agents if not a.is_dead)
+
+    # FIX 1 — regression guard: after a birth, live count must not decrease
+    if inserted > 0 and live_after < live_before:
+        print(
+            f"[BUG] Population shrank after birth! "
+            f"before={live_before} inserted={inserted} after={live_after}"
+        )
+
     return agents
+
+
+def _find_agent_by_id(agents, agent_id):
+    """Return the live agent with the given id, or None."""
+    for a in agents:
+        if a.id == agent_id and not a.is_dead:
+            return a
+    return None
 
 
 # ─── main loop ───────────────────────────────────────────────
@@ -173,35 +204,37 @@ while running:
                 tx, ty = int(wx / TILE_SIZE), int(wy / TILE_SIZE)
                 if 0 <= ty < WORLD_H and 0 <= tx < WORLD_W:
                     world.start_fire(ty, tx)
-            # Orbit with Q/E
             elif event.key == pygame.K_q:  renderer.orbit(-15, 0)
             elif event.key == pygame.K_e:  renderer.orbit( 15, 0)
-            # Tilt with Z/X
             elif event.key == pygame.K_z:  renderer.orbit(0, -8)
             elif event.key == pygame.K_x:  renderer.orbit(0,  8)
 
         elif event.type == pygame.MOUSEBUTTONDOWN:
             if event.button == 1:
                 mx, my = event.pos
+
                 # ── colonist panel click ──────────────────────
-                clicked_ag = draw_colonist_panel(hud_surf, mx, my, agents, selected_agent,
-                                                 agent_panel_active=bool(selected_agent and not selected_agent.is_dead))
+                clicked_ag = draw_colonist_panel(
+                    hud_surf, mx, my, agents, selected_agent,
+                    agent_panel_active=bool(selected_agent and not selected_agent.is_dead),
+                )
                 if clicked_ag:
                     selected_agent = clicked_ag
                 else:
-                    # ── agent selection ───────────────────────
+                    # ── agent pick in world ───────────────────
                     wx, wz = renderer.screen_to_world(mx, my)
-                    # agent pick (tile coords)
                     tx = wx / TILE_SIZE
                     ty = wz / TILE_SIZE
                     best_d = 3.0
                     selected_agent = None
                     for ag in agents:
-                        if ag.is_dead: continue
+                        if ag.is_dead:
+                            continue
                         d = math.sqrt((ag.x - tx)**2 + (ag.y - ty)**2)
                         if d < best_d:
                             best_d = d
                             selected_agent = ag
+
             elif event.button == 2:
                 _drag_active = True
                 _drag_last   = event.pos
@@ -222,7 +255,7 @@ while running:
                 _drag_last = event.pos
 
         elif event.type == pygame.VIDEORESIZE:
-            screen = pygame.display.set_mode(event.size, flags)
+            screen   = pygame.display.set_mode(event.size, flags)
             renderer.screen_w = event.w
             renderer.screen_h = event.h
             hud_surf = pygame.Surface(event.size, pygame.SRCALPHA)
@@ -230,8 +263,8 @@ while running:
             hud_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
 
     # ── keyboard pan ─────────────────────────────────────────
-    keys = pygame.key.get_pressed()
-    pan_spd = 6.0 * real_dt * (1.0 + renderer.cam_dist * 0.04)
+    keys     = pygame.key.get_pressed()
+    pan_spd  = 6.0 * real_dt * (1.0 + renderer.cam_dist * 0.04)
     panning  = False
     if keys[pygame.K_LEFT]  or keys[pygame.K_a]: renderer.pan(-pan_spd, 0); panning = True
     if keys[pygame.K_RIGHT] or keys[pygame.K_d]: renderer.pan( pan_spd, 0); panning = True
@@ -240,10 +273,10 @@ while running:
     if panning:
         selected_agent = None
 
-    # ── camera follow selected colonist ──────────────────────
+    # ── camera follow ─────────────────────────────────────────
     if selected_agent and not selected_agent.is_dead:
-        target_wx = selected_agent.x * TILE_SIZE + TILE_SIZE / 2
-        target_wz = selected_agent.y * TILE_SIZE + TILE_SIZE / 2
+        target_wx    = selected_agent.x * TILE_SIZE + TILE_SIZE / 2
+        target_wz    = selected_agent.y * TILE_SIZE + TILE_SIZE / 2
         follow_speed = min(1.0, 8.0 * real_dt)
         renderer.cam_target[0] += (target_wx - renderer.cam_target[0]) * follow_speed
         renderer.cam_target[2] += (target_wz - renderer.cam_target[2]) * follow_speed
@@ -254,21 +287,18 @@ while running:
 
         world.tick(real_dt)
 
-        # Collect new children separately so we can do a safe insert
         new_children = []
         for ag in agents:
             ag.tick(world, agents, real_dt)
-            # Pass sim_speed-scaled dt to pregnancy so it advances correctly
             child = ag.tick_pregnancy(world, agents, real_dt * sim_speed_ref[0])
             if child is not None:
+                # FIX 1 — extra check: child must not be the same object as mother
+                assert child is not ag, f"BUG: tick_pregnancy returned the mother itself!"
                 new_children.append(child)
 
-        # Safe population-capped insertion — never exceeds MAX_AGENTS,
-        # never lets a newborn arrive in a broken state.
         if new_children:
             agents = _insert_newborns(agents, new_children)
 
-        # Remove dead agents
         agents = [a for a in agents if not a.is_dead]
 
         if frame_no % 120 == 0:
@@ -284,15 +314,33 @@ while running:
 
     # HUD composite
     hud_surf.fill((0, 0, 0, 0))
-    draw_hud(hud_surf, world, agents, selected_agent, pop_history,
-             sim_speed_ref, fps=fps_now, cam_yaw=renderer.cam_yaw)
 
-    # Colonist leaderboard panel — drawn with live mouse for hover/click
+    # FIX 3 / 4 / 5 — Draw per-agent icons (sleep / pregnancy / hearts)
+    draw_agent_icons(hud_surf, agents, renderer)
+
+    # draw_hud now returns clicked_friend_id (FIX 6)
     mx_now, my_now = pygame.mouse.get_pos()
-    draw_colonist_panel(hud_surf, mx_now, my_now, agents, selected_agent,
-                        agent_panel_active=bool(selected_agent and not selected_agent.is_dead))
+    clicked_friend_id = draw_hud(
+        hud_surf, world, agents, selected_agent, pop_history,
+        sim_speed_ref, fps=fps_now, cam_yaw=renderer.cam_yaw,
+    )
 
-    raw = pygame.image.tostring(hud_surf, "RGBA", False)
+    # Colonist leaderboard
+    clicked_from_list = draw_colonist_panel(
+        hud_surf, mx_now, my_now, agents, selected_agent,
+        agent_panel_active=bool(selected_agent and not selected_agent.is_dead),
+    )
+
+    # FIX 6 — Handle friend-list click: select the friend
+    if pygame.mouse.get_pressed()[0]:
+        if clicked_friend_id:
+            found = _find_agent_by_id(agents, clicked_friend_id)
+            if found:
+                selected_agent = found
+        if clicked_from_list:
+            selected_agent = clicked_from_list
+
+    raw     = pygame.image.tostring(hud_surf, "RGBA", False)
     hud_tex.write(raw)
     hud_tex.use(0)
     ctx.disable(moderngl.DEPTH_TEST)
