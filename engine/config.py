@@ -54,6 +54,53 @@ TERRAIN_SEED         = 42
 # GPU / rendering
 GPU_AVAILABLE        = False  # detected at startup
 
+# ── Social relationship system ────────────────────────────────
+
+# Friendship
+MAX_FRIENDS          = 6        # cap on non-family friends
+FRIEND_NEAR_GAIN     = 0.04     # score gained per sim-second while adjacent
+FRIEND_SHARE_GAIN    = 2.0      # score gained when an agent shares an item
+FRIEND_DANGER_GAIN   = 5.0      # score gained when surviving danger together
+FRIEND_FORGET_CHANCE = 0.001    # chance per tick a non-refreshed friendship decays
+FRIEND_FORGET_AMOUNT = 1.0      # how much the score drops on a forget tick
+FRIEND_THRESHOLD     = 10.0     # score needed to be "friends"
+FRIEND_MATE_THRESHOLD = 25.0    # minimum friendship score to attempt reproduction
+FAMILY_FRIEND_BONUS  = 999.0    # internal constant: family ties never decay
+
+# Nemesis
+NEMESIS_CHANCE       = 0.08     # chance per collision/fight tick two males become nemeses
+NEMESIS_FIGHT_CHANCE = 0.15     # chance per tick nemeses start a fight when close
+FIGHT_JOIN_CHANCE    = 0.25     # chance a nearby friend joins a fight
+FIGHT_DAMAGE         = 5.0      # health damage per fight tick
+FIGHT_MOOD_LOSS      = 3.0      # mood hit on fight winner too
+
+# Reproduction
+PREGNANCY_COOLDOWN   = 180.0    # sim-seconds before a mother can conceive again
+POSTPARTUM_HEALTH    = 60.0     # mother health floor right after birth (prevents death)
+BIRTH_SUCCESS_RATE   = 0.30     # base chance a qualifying pair actually conceives
+# Soft population pressure: birth chance scales by (1 - pop/MAX_AGENTS)^POP_PRESSURE_EXP
+POP_PRESSURE_EXP     = 2.0
+REPRO_MIN_FOOD       = 30       # minimum total food value in inventory to conceive
+REPRO_MIN_HUNGER     = 55       # minimum hunger stat to conceive
+REPRO_MIN_MOOD       = 55       # minimum mood stat to conceive
+REPRO_NEED_SHELTER   = False    # set True to require a home_y to conceive
+
+# Baby
+BABY_GRACE_PERIOD    = 60.0     # sim-seconds after birth where baby gets extra protection
+BABY_HEALTH_START    = 90.0     # newborns start with high health
+BABY_HUNGER_DECAY    = 0.55     # hunger decay multiplier for babies (lower than adults)
+BABY_THIRST_DECAY    = 0.80     # thirst decay multiplier for babies
+BABY_DRINK_RADIUS    = 3        # babies can drink from water tiles up to this many tiles away
+
+# Drinking / thirst satisfaction
+DRINK_COOLDOWN       = 20.0     # sim-seconds agent cannot re-select drink after drinking full
+DRINK_THRESHOLD      = 45.0     # thirst must be BELOW this to trigger seek-water priority
+DRINK_SATISFIED      = 85.0     # thirst level considered "satisfied" (resets cooldown timer)
+
+# Building utility thresholds
+BUILD_FOOD_SURPLUS   = 60       # total food value above which building becomes attractive
+BUILD_PREFER_THRESH  = 70       # hunger+thirst+warmth all above this → prefer build/improve
+
 # Colors (RGBA float)
 COL_GRASS      = (0.22, 0.45, 0.15, 1.0)
 COL_DIRT       = (0.55, 0.38, 0.22, 1.0)
