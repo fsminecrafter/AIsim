@@ -45,8 +45,8 @@ MUTATION_RATE        = 0.05
 KNOWLEDGE_INHERIT    = 0.7
 
 # Neural network size (number of hidden units in agent weight vector)
-# 12 = original, can be expanded
-NEURAL_SIZE          = 12
+# 14 = new default (includes A_SLEEP + A_RECREATE)
+NEURAL_SIZE          = 14
 
 # Terrain seed
 TERRAIN_SEED         = 42
@@ -57,49 +57,63 @@ GPU_AVAILABLE        = False  # detected at startup
 # ── Social relationship system ────────────────────────────────
 
 # Friendship
-MAX_FRIENDS          = 6        # cap on non-family friends
-FRIEND_NEAR_GAIN     = 0.04     # score gained per sim-second while adjacent
-FRIEND_SHARE_GAIN    = 2.0      # score gained when an agent shares an item
-FRIEND_DANGER_GAIN   = 5.0      # score gained when surviving danger together
-FRIEND_FORGET_CHANCE = 0.001    # chance per tick a non-refreshed friendship decays
-FRIEND_FORGET_AMOUNT = 1.0      # how much the score drops on a forget tick
-FRIEND_THRESHOLD     = 10.0     # score needed to be "friends"
-FRIEND_MATE_THRESHOLD = 25.0    # minimum friendship score to attempt reproduction
-FAMILY_FRIEND_BONUS  = 999.0    # internal constant: family ties never decay
+MAX_FRIENDS          = 6
+FRIEND_NEAR_GAIN     = 0.04
+FRIEND_SHARE_GAIN    = 2.0
+FRIEND_DANGER_GAIN   = 5.0
+FRIEND_FORGET_CHANCE = 0.001
+FRIEND_FORGET_AMOUNT = 1.0
+FRIEND_THRESHOLD     = 10.0
+FRIEND_MATE_THRESHOLD = 25.0
+FAMILY_FRIEND_BONUS  = 999.0
 
 # Nemesis
-NEMESIS_CHANCE       = 0.08     # chance per collision/fight tick two males become nemeses
-NEMESIS_FIGHT_CHANCE = 0.15     # chance per tick nemeses start a fight when close
-FIGHT_JOIN_CHANCE    = 0.25     # chance a nearby friend joins a fight
-FIGHT_DAMAGE         = 5.0      # health damage per fight tick
-FIGHT_MOOD_LOSS      = 3.0      # mood hit on fight winner too
+NEMESIS_CHANCE       = 0.08
+NEMESIS_FIGHT_CHANCE = 0.15
+FIGHT_JOIN_CHANCE    = 0.25
+FIGHT_DAMAGE         = 5.0
+FIGHT_MOOD_LOSS      = 3.0
 
 # Reproduction
-PREGNANCY_COOLDOWN   = 180.0    # sim-seconds before a mother can conceive again
-POSTPARTUM_HEALTH    = 60.0     # mother health floor right after birth (prevents death)
-BIRTH_SUCCESS_RATE   = 0.30     # base chance a qualifying pair actually conceives
-# Soft population pressure: birth chance scales by (1 - pop/MAX_AGENTS)^POP_PRESSURE_EXP
+PREGNANCY_COOLDOWN   = 180.0
+POSTPARTUM_HEALTH    = 60.0
+BIRTH_SUCCESS_RATE   = 0.30
 POP_PRESSURE_EXP     = 2.0
-REPRO_MIN_FOOD       = 30       # minimum total food value in inventory to conceive
-REPRO_MIN_HUNGER     = 55       # minimum hunger stat to conceive
-REPRO_MIN_MOOD       = 55       # minimum mood stat to conceive
-REPRO_NEED_SHELTER   = False    # set True to require a home_y to conceive
+REPRO_MIN_FOOD       = 30
+REPRO_MIN_HUNGER     = 55
+REPRO_MIN_MOOD       = 55
+REPRO_NEED_SHELTER   = False
 
 # Baby
-BABY_GRACE_PERIOD    = 60.0     # sim-seconds after birth where baby gets extra protection
-BABY_HEALTH_START    = 90.0     # newborns start with high health
-BABY_HUNGER_DECAY    = 0.55     # hunger decay multiplier for babies (lower than adults)
-BABY_THIRST_DECAY    = 0.80     # thirst decay multiplier for babies
-BABY_DRINK_RADIUS    = 3        # babies can drink from water tiles up to this many tiles away
+BABY_GRACE_PERIOD    = 60.0
+BABY_HEALTH_START    = 90.0
+BABY_HUNGER_DECAY    = 0.55
+BABY_THIRST_DECAY    = 0.80
+BABY_DRINK_RADIUS    = 3
 
 # Drinking / thirst satisfaction
-DRINK_COOLDOWN       = 20.0     # sim-seconds agent cannot re-select drink after drinking full
-DRINK_THRESHOLD      = 45.0     # thirst must be BELOW this to trigger seek-water priority
-DRINK_SATISFIED      = 85.0     # thirst level considered "satisfied" (resets cooldown timer)
+DRINK_COOLDOWN       = 20.0
+DRINK_THRESHOLD      = 45.0
+DRINK_SATISFIED      = 85.0
 
 # Building utility thresholds
-BUILD_FOOD_SURPLUS   = 60       # total food value above which building becomes attractive
-BUILD_PREFER_THRESH  = 70       # hunger+thirst+warmth all above this → prefer build/improve
+BUILD_FOOD_SURPLUS   = 60
+BUILD_PREFER_THRESH  = 70
+
+# ── Sleep (FIX 3) ─────────────────────────────────────────────
+SLEEP_NIGHT_MOOD_THRESH = 40.0   # mood below this at night → try to sleep
+SLEEP_MIN_DURATION      = 15.0   # minimum sim-seconds per nap
+SLEEP_MAX_DURATION      = 45.0   # maximum sim-seconds per nap
+SLEEP_WARMTH_RESTORE    = 2.0    # warmth/s while sleeping
+SLEEP_MOOD_RESTORE      = 1.5    # mood/s while sleeping
+SLEEP_HEALTH_RESTORE    = 0.3    # health/s while sleeping
+
+# ── Recreation gate (FIX 2) ───────────────────────────────────
+RECREATION_FOOD_GATE    = 20     # food-value units above which recreation kicks in
+RECREATION_VITAL_GATE   = 60.0   # all core vitals must exceed this to recreate
+
+# ── Heart effect (FIX 5) ──────────────────────────────────────
+HEART_EFFECT_DURATION   = 3.0    # seconds heart floats above colonist after conception
 
 # Colors (RGBA float)
 COL_GRASS      = (0.22, 0.45, 0.15, 1.0)
