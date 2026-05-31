@@ -1,10 +1,10 @@
 # ─────────────────────────────────────────────────────────────
-#  Survival Simulation — Configuration
+#  Survival Simulation — Configuration  (v4)
 # ─────────────────────────────────────────────────────────────
 
-# World
-WORLD_W       = 80
-WORLD_H       = 80
+# World  (increased from 80×80)
+WORLD_W       = 128
+WORLD_H       = 128
 TILE_SIZE     = 10.0
 
 # Display
@@ -31,7 +31,7 @@ DAY_DURATION       = 60.0
 SEASON_DAYS        = 20
 SEASONS            = ["spring", "summer", "autumn", "winter"]
 
-# Seasons enabled (can be overridden by menu)
+# Seasons enabled
 SEASONS_ENABLED    = True
 STARTING_SEASON    = 0   # 0=spring 1=summer 2=autumn 3=winter
 
@@ -45,7 +45,6 @@ MUTATION_RATE        = 0.05
 KNOWLEDGE_INHERIT    = 0.7
 
 # Neural network size (number of hidden units in agent weight vector)
-# 14 = new default (includes A_SLEEP + A_RECREATE)
 NEURAL_SIZE          = 14
 
 # Terrain seed
@@ -97,23 +96,30 @@ DRINK_THRESHOLD      = 45.0
 DRINK_SATISFIED      = 85.0
 
 # Building utility thresholds
-BUILD_FOOD_SURPLUS   = 60
-BUILD_PREFER_THRESH  = 70
+BUILD_FOOD_SURPLUS   = 40       # lowered so agents build sooner
+BUILD_PREFER_THRESH  = 55       # lowered so building is easier to trigger
 
 # ── Sleep (FIX 3) ─────────────────────────────────────────────
-SLEEP_NIGHT_MOOD_THRESH = 40.0   # mood below this at night → try to sleep
-SLEEP_MIN_DURATION      = 15.0   # minimum sim-seconds per nap
-SLEEP_MAX_DURATION      = 45.0   # maximum sim-seconds per nap
-SLEEP_WARMTH_RESTORE    = 2.0    # warmth/s while sleeping
-SLEEP_MOOD_RESTORE      = 1.5    # mood/s while sleeping
-SLEEP_HEALTH_RESTORE    = 0.3    # health/s while sleeping
+SLEEP_NIGHT_MOOD_THRESH = 40.0
+SLEEP_MIN_DURATION      = 15.0
+SLEEP_MAX_DURATION      = 45.0
+SLEEP_WARMTH_RESTORE    = 2.0
+SLEEP_MOOD_RESTORE      = 1.5
+SLEEP_HEALTH_RESTORE    = 0.3
 
-# ── Recreation gate (FIX 2) ───────────────────────────────────
-RECREATION_FOOD_GATE    = 20     # food-value units above which recreation kicks in
-RECREATION_VITAL_GATE   = 60.0   # all core vitals must exceed this to recreate
+# ── Recreation gate ───────────────────────────────────────────
+# Lowered thresholds so recreation keeps being triggered, not just early-game
+RECREATION_FOOD_GATE    = 15     # reduced from 20
+RECREATION_VITAL_GATE   = 55.0   # reduced from 60
 
-# ── Heart effect (FIX 5) ──────────────────────────────────────
-HEART_EFFECT_DURATION   = 3.0    # seconds heart floats above colonist after conception
+# ── Heart effect ──────────────────────────────────────────────
+HEART_EFFECT_DURATION   = 3.0
+
+# ── Building structures ───────────────────────────────────────
+# Houses now replace a tile (no wooden_block needed, use wood directly)
+HOUSE_WOOD_COST         = 6      # wood needed to build a house
+FARM_HOE_COST           = 1      # 1 hoe
+FARM_WOOD_COST          = 6      # 6 wood
 
 # Colors (RGBA float)
 COL_GRASS      = (0.22, 0.45, 0.15, 1.0)
