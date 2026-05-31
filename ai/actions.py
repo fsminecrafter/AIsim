@@ -1,12 +1,7 @@
 """
 Shared action identifiers for the agent decision system and HUD.
-
-Keep these constants in a lightweight module so display code can render action
-labels without importing the full agent implementation and its simulation-time
-dependencies.
 """
 
-# ─── Action IDs ───────────────────────────────────────────────
 A_FLEE_FIRE  = 0
 A_DRINK      = 1
 A_SEEK_SAFETY = 2
@@ -19,8 +14,8 @@ A_CRAFT_TOOL = 8
 A_BUILD      = 9
 A_SEEK_MATE  = 10
 A_WANDER     = 11
-A_SLEEP      = 12   # NEW: sleep/rest state
-A_RECREATE   = 13   # NEW: socialise / help / idle when needs are met
+A_SLEEP      = 12
+A_RECREATE   = 13
 
 ACTION_NAMES = [
     "🔥Flee", "💧Drink", "🛡Safety", "🔍Water", "🍎Food",
