@@ -20,6 +20,7 @@ A_RECREATE   = 13
 ACTION_NAMES = [
     "🔥Flee", "💧Drink", "🛡Safety", "🔍Water", "🍎Food",
     "🌡Warmth", "🌾Forage", "📦Stock", "🔨Craft", "🏠Build",
+    "❤Mate", "👣Wander"
     "❤Mate", "👣Wander", "😴Sleep", "🎉Recreate",
 ]
 NUM_ACTIONS = len(ACTION_NAMES)

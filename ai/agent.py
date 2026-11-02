@@ -29,6 +29,22 @@ from ai.actions import (
 from engine.config import *
 from world.world import *
 
+from ai.actions import (
+    ACTION_NAMES,
+    NUM_ACTIONS,
+    A_FLEE_FIRE,
+    A_DRINK,
+    A_SEEK_SAFETY,
+    A_FIND_WATER,
+    A_FIND_FOOD,
+    A_SEEK_WARMTH,
+    A_FORAGE,
+    A_STOCKPILE,
+    A_CRAFT_TOOL,
+    A_BUILD,
+    A_SEEK_MATE,
+    A_WANDER,
+)
 
 ITEM_FOOD_VALUE = {
     "berry":       15,
