@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-SURVIVAL SIMULATION
-===================
-GPU-accelerated (OpenGL via ModernGL) survival world with
-Numba-JIT AI kernels, full lifecycle, learning agents.
+SURVIVAL SIMULATION — 3D GPU Edition
+=====================================
+Full 3D perspective rendering with OpenGL 3.3 core via ModernGL.
+Agents: capsules. Trees: cylinders + sphere canopy. Rocks: spheres.
+Logs/planks: box meshes. Terrain heightmap. Weather particles.
+
+v3 — FIX 1: birth sanity checks + population logging.
+           FIX 6: friend-click selection wired from HUD return value.
+           FIX 3/4/5: draw_agent_icons called each frame.
 """
 
 import sys, os
@@ -16,40 +21,31 @@ import moderngl
 
 from engine.config import *
 from engine.renderer import Renderer
-from engine.hud import draw_hud
+from engine.hud import draw_hud, draw_colonist_panel, draw_agent_icons
 from world.world import World
 from ai.agent import Agent
-from engine.menu import run_menu  # 1. Import the configuration menu module
+from engine.menu import run_menu
 
-# ─── init & pre-launch menu ───────────────────────────────────
+# ─── init ─────────────────────────────────────────────────────
 pygame.init()
 
-# 2. Launch configuration screen before binding the OpenGL context
-# We pass gpu_available=True here because the engine requires ModernGL/OpenGL 3.3 core
 menu_settings = run_menu(gpu_available=True)
-
-# If the user closed the window or pressed ESC in the menu, exit cleanly
 if menu_settings is None:
     pygame.quit()
     sys.exit(0)
 
-# 3. Dynamic config updates from menu parameters
 import engine.config as cfg
 cfg.INITIAL_AGENTS = menu_settings["population"]
 
-# 4. Initialize OpenGL Display Mode with config dimensions
-pygame.display.set_caption("Survival Simulation — GPU Edition")
-flags = pygame.DOUBLEBUF | pygame.OPENGL | pygame.RESIZABLE
+pygame.display.set_caption("Survival Simulation — 3D GPU Edition")
+flags  = pygame.DOUBLEBUF | pygame.OPENGL | pygame.RESIZABLE
 screen = pygame.display.set_mode((SCREEN_W, SCREEN_H), flags)
 
-# ModernGL context from pygame GL context
 ctx = moderngl.create_context()
 
-# pygame surface for HUD (we render it as a texture on top)
+# HUD surface composited over GL
 hud_surf = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
-
-# create HUD texture
-hud_tex = ctx.texture((SCREEN_W, SCREEN_H), 4)
+hud_tex  = ctx.texture((SCREEN_W, SCREEN_H), 4)
 hud_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
 
 HUD_VERT = """
@@ -74,142 +70,219 @@ fs_vbo   = ctx.buffer(fs_quad.tobytes())
 hud_vao  = ctx.vertex_array(hud_prog, [(fs_vbo, '2f', 'in_vert')])
 hud_prog["u_tex"].value = 0
 
-# ─── simulation state ─────────────────────────────────────────
-# 5. Apply the customized seed and seasonal parameters from menu
-world = World(seed=menu_settings["terrain_seed"])
-
-# If your World object has attributes to parse seasons, map them here:
+# ─── sim state ────────────────────────────────────────────────
+world    = World(seed=menu_settings["terrain_seed"])
 if hasattr(world, "enable_seasons"):
-    world.enable_seasons = menu_settings["seasons"]
-    world.current_season = menu_settings["start_season"]
+    world.enable_seasons  = menu_settings["seasons"]
+    world.current_season  = menu_settings["start_season"]
 
 agents   = []
 renderer = Renderer(ctx, SCREEN_W, SCREEN_H)
 
-# spawn initial agents matching menu settings
-# 6. Explicitly forward 'neural_size' constraint to custom agent architectures if applicable
-for i in range(cfg.INITIAL_AGENTS):
-    x = random.uniform(WORLD_W * 0.2, WORLD_W * 0.8)
-    y = random.uniform(WORLD_H * 0.2, WORLD_H * 0.8)
-    
-    # Injecting custom neural parameters if supported by Agent __init__
-    if "neural_size" in menu_settings:
-        a = Agent(x, y, hidden_size=menu_settings["neural_size"])
-    else:
-        a = Agent(x, y)
-        
-    a.inv_add("berry", 3, freshness=90.0)
-    a.inv_add("rock",  2)
-    agents.append(a)
 
-pop_history   = [len(agents)]
+def _spawn_agents(n):
+    result = []
+    for _ in range(n):
+        x = random.uniform(WORLD_W * 0.2, WORLD_W * 0.8)
+        y = random.uniform(WORLD_H * 0.2, WORLD_H * 0.8)
+        kw = {}
+        if "neural_size" in menu_settings:
+            kw["hidden_size"] = menu_settings["neural_size"]
+        a = Agent(x, y, **kw)
+        a.inv_add("berry", 3, freshness=90.0)
+        a.inv_add("rock",  2)
+        result.append(a)
+    return result
+
+
+agents = _spawn_agents(cfg.INITIAL_AGENTS)
+pop_history    = [len(agents)]
 selected_agent = None
 paused         = False
 sim_speed_ref  = [SIM_SPEED]
 
-clock      = pygame.time.Clock()
-last_time  = time.perf_counter()
-frame_no   = 0
-pan_speed  = 40.0  # tiles per second when panning
+clock     = pygame.time.Clock()
+last_time = time.perf_counter()
+frame_no  = 0
+
+_drag_active = False
+_drag_last   = (0, 0)
 
 
 def reset():
     global world, agents, pop_history, selected_agent
-    # Generate a random seed during hot resets or track menu settings
-    new_seed = random.randint(0, 999) if menu_settings is None else menu_settings["terrain_seed"]
-    world = World(seed=new_seed)
-    
+    seed = menu_settings["terrain_seed"] if menu_settings else random.randint(0, 9999)
+    world = World(seed=seed)
     if hasattr(world, "enable_seasons"):
         world.enable_seasons = menu_settings["seasons"]
         world.current_season = menu_settings["start_season"]
-
-    agents = []
-    for i in range(cfg.INITIAL_AGENTS):
-        x = random.uniform(WORLD_W * 0.2, WORLD_W * 0.8)
-        y = random.uniform(WORLD_H * 0.2, WORLD_H * 0.8)
-        
-        if "neural_size" in menu_settings:
-            a = Agent(x, y, hidden_size=menu_settings["neural_size"])
-        else:
-            a = Agent(x, y)
-            
-        a.inv_add("berry", 3, freshness=90.0)
-        a.inv_add("rock",  2)
-        agents.append(a)
+    renderer._height_map = None
+    agents = _spawn_agents(cfg.INITIAL_AGENTS)
     pop_history    = [len(agents)]
     selected_agent = None
 
 
-# ─── main loop ────────────────────────────────────────────────
+def _insert_newborns(agents, new_children):
+    """
+    FIX 1 — Safely insert newborns into the population.
+
+    Rules enforced here:
+    - The child is a brand-new Agent instance (never the mother).
+    - Never exceed MAX_AGENTS.
+    - Children are appended; no existing entry is overwritten.
+    - Logs births and detects if parent count shrank (regression guard).
+    """
+    live_before = sum(1 for a in agents if not a.is_dead)
+    inserted    = 0
+
+    for child in new_children:
+        if live_before + inserted >= MAX_AGENTS:
+            break
+
+        # FIX 1 — sanity: child must be a distinct object not already in list
+        already_in = any(a is child for a in agents)
+        if already_in:
+            print(f"[BUG] tick_pregnancy returned an agent already in the list: {child.id}")
+            continue
+
+        # Ensure valid starting state
+        if child.health <= 0:
+            child.health = BABY_HEALTH_START
+        if child.hunger <= 0:
+            child.hunger = 70.0
+        if child.thirst <= 0:
+            child.thirst = 70.0
+        child.is_dead = False
+
+        agents.append(child)   # APPEND — never overwrite
+        inserted += 1
+
+    live_after = sum(1 for a in agents if not a.is_dead)
+
+    # FIX 1 — regression guard: after a birth, live count must not decrease
+    if inserted > 0 and live_after < live_before:
+        print(
+            f"[BUG] Population shrank after birth! "
+            f"before={live_before} inserted={inserted} after={live_after}"
+        )
+
+    return agents
+
+
+def _find_agent_by_id(agents, agent_id):
+    """Return the live agent with the given id, or None."""
+    for a in agents:
+        if a.id == agent_id and not a.is_dead:
+            return a
+    return None
+
+
+# ─── main loop ───────────────────────────────────────────────
 running = True
 while running:
-    now     = time.perf_counter()
-    real_dt = min(now - last_time, 0.05)   # cap at 50ms to prevent spiral
+    now      = time.perf_counter()
+    real_dt  = min(now - last_time, 0.05)
     last_time = now
+    fps_now  = clock.get_fps()
 
-    # ── events ────────────────────────────────────────────────
+    # ── events ───────────────────────────────────────────────
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
 
         elif event.type == pygame.KEYDOWN:
-            if event.key == pygame.K_ESCAPE:
-                running = False
-            elif event.key == pygame.K_SPACE:
-                paused = not paused
-            elif event.key == pygame.K_r:
-                reset()
+            if   event.key == pygame.K_ESCAPE:  running = False
+            elif event.key == pygame.K_SPACE:   paused = not paused
+            elif event.key == pygame.K_r:       reset()
             elif event.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
                 sim_speed_ref[0] = min(50.0, sim_speed_ref[0] * 1.5)
             elif event.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
                 sim_speed_ref[0] = max(0.1, sim_speed_ref[0] / 1.5)
             elif event.key == pygame.K_f:
-                # start fire at camera centre
                 mx, my = pygame.mouse.get_pos()
                 wx, wy = renderer.screen_to_world(mx, my)
                 tx, ty = int(wx / TILE_SIZE), int(wy / TILE_SIZE)
                 if 0 <= ty < WORLD_H and 0 <= tx < WORLD_W:
                     world.start_fire(ty, tx)
+            elif event.key == pygame.K_q:  renderer.orbit(-15, 0)
+            elif event.key == pygame.K_e:  renderer.orbit( 15, 0)
+            elif event.key == pygame.K_z:  renderer.orbit(0, -8)
+            elif event.key == pygame.K_x:  renderer.orbit(0,  8)
 
         elif event.type == pygame.MOUSEBUTTONDOWN:
             if event.button == 1:
                 mx, my = event.pos
-                wx, wy = renderer.screen_to_world(mx, my)
-                tx = wx / TILE_SIZE
-                ty = wy / TILE_SIZE
-                # find nearest agent
-                best_d = 2.5
-                selected_agent = None
-                for ag in agents:
-                    if ag.is_dead: continue
-                    d = math.sqrt((ag.x - tx)**2 + (ag.y - ty)**2)
-                    if d < best_d:
-                        best_d = d
-                        selected_agent = ag
+
+                # ── colonist panel click ──────────────────────
+                clicked_ag = draw_colonist_panel(
+                    hud_surf, mx, my, agents, selected_agent,
+                    agent_panel_active=bool(selected_agent and not selected_agent.is_dead),
+                )
+                if clicked_ag:
+                    selected_agent = clicked_ag
+                else:
+                    # ── agent pick in world ───────────────────
+                    wx, wz = renderer.screen_to_world(mx, my)
+                    tx = wx / TILE_SIZE
+                    ty = wz / TILE_SIZE
+                    best_d = 3.0
+                    selected_agent = None
+                    for ag in agents:
+                        if ag.is_dead:
+                            continue
+                        d = math.sqrt((ag.x - tx)**2 + (ag.y - ty)**2)
+                        if d < best_d:
+                            best_d = d
+                            selected_agent = ag
+
+            elif event.button == 2:
+                _drag_active = True
+                _drag_last   = event.pos
             elif event.button == 4:
                 renderer.zoom_by(1.12)
             elif event.button == 5:
                 renderer.zoom_by(1 / 1.12)
 
+        elif event.type == pygame.MOUSEBUTTONUP:
+            if event.button == 2:
+                _drag_active = False
+
+        elif event.type == pygame.MOUSEMOTION:
+            if _drag_active:
+                dx = event.pos[0] - _drag_last[0]
+                dy = event.pos[1] - _drag_last[1]
+                renderer.orbit(dx * 0.5, dy * 0.4)
+                _drag_last = event.pos
+
         elif event.type == pygame.VIDEORESIZE:
-            screen = pygame.display.set_mode(event.size, flags)
+            screen   = pygame.display.set_mode(event.size, flags)
             renderer.screen_w = event.w
             renderer.screen_h = event.h
             hud_surf = pygame.Surface(event.size, pygame.SRCALPHA)
-            hud_tex = ctx.texture(event.size, 4)
+            hud_tex  = ctx.texture(event.size, 4)
             hud_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
 
-    # ── keyboard pan ──────────────────────────────────────────
-    keys = pygame.key.get_pressed()
-    if keys[pygame.K_LEFT]  or keys[pygame.K_a]: renderer.pan(-pan_speed * real_dt * TILE_SIZE, 0)
-    if keys[pygame.K_RIGHT] or keys[pygame.K_d]: renderer.pan( pan_speed * real_dt * TILE_SIZE, 0)
-    if keys[pygame.K_UP]    or keys[pygame.K_w]: renderer.pan(0,  pan_speed * real_dt * TILE_SIZE)
-    if keys[pygame.K_DOWN]  or keys[pygame.K_s]: renderer.pan(0, -pan_speed * real_dt * TILE_SIZE)
+    # ── keyboard pan ─────────────────────────────────────────
+    keys     = pygame.key.get_pressed()
+    pan_spd  = 6.0 * real_dt * (1.0 + renderer.cam_dist * 0.04)
+    panning  = False
+    if keys[pygame.K_LEFT]  or keys[pygame.K_a]: renderer.pan(-pan_spd, 0); panning = True
+    if keys[pygame.K_RIGHT] or keys[pygame.K_d]: renderer.pan( pan_spd, 0); panning = True
+    if keys[pygame.K_UP]    or keys[pygame.K_w]: renderer.pan(0, -pan_spd); panning = True
+    if keys[pygame.K_DOWN]  or keys[pygame.K_s]: renderer.pan(0,  pan_spd); panning = True
+    if panning:
+        selected_agent = None
 
-    # ── simulation update ─────────────────────────────────────
+    # ── camera follow ─────────────────────────────────────────
+    if selected_agent and not selected_agent.is_dead:
+        target_wx    = selected_agent.x * TILE_SIZE + TILE_SIZE / 2
+        target_wz    = selected_agent.y * TILE_SIZE + TILE_SIZE / 2
+        follow_speed = min(1.0, 8.0 * real_dt)
+        renderer.cam_target[0] += (target_wx - renderer.cam_target[0]) * follow_speed
+        renderer.cam_target[2] += (target_wz - renderer.cam_target[2]) * follow_speed
+
+    # ── simulation update ────────────────────────────────────
     if not paused:
-        # update sim speed in config
-        import engine.config as cfg
         cfg.SIM_SPEED = sim_speed_ref[0]
 
         world.tick(real_dt)
@@ -218,37 +291,62 @@ while running:
         for ag in agents:
             ag.tick(world, agents, real_dt)
             child = ag.tick_pregnancy(world, agents, real_dt * sim_speed_ref[0])
-            if child and len(agents) + len(new_children) < MAX_AGENTS:
+            if child is not None:
+                # FIX 1 — extra check: child must not be the same object as mother
+                assert child is not ag, f"BUG: tick_pregnancy returned the mother itself!"
                 new_children.append(child)
 
-        agents.extend(new_children)
+        if new_children:
+            agents = _insert_newborns(agents, new_children)
 
-        # prune dead
         agents = [a for a in agents if not a.is_dead]
 
-        # record population every ~2 real seconds
         if frame_no % 120 == 0:
             pop_history.append(len(agents))
             if len(pop_history) > 500:
                 pop_history = pop_history[-500:]
 
-        # clean selected
         if selected_agent and selected_agent.is_dead:
             selected_agent = None
 
-    # ── render ────────────────────────────────────────────────
-    renderer.render(world, agents)
+    # ── render ───────────────────────────────────────────────
+    renderer.render(world, agents, real_dt)
 
-    # HUD: render to pygame surface, upload to GL texture, composite
+    # HUD composite
     hud_surf.fill((0, 0, 0, 0))
-    draw_hud(hud_surf, world, agents, selected_agent, pop_history, sim_speed_ref)
 
-    # upload hud surface to GL texture
-    raw = pygame.image.tostring(hud_surf, "RGBA", False)
+    # FIX 3 / 4 / 5 — Draw per-agent icons (sleep / pregnancy / hearts)
+    draw_agent_icons(hud_surf, agents, renderer)
+
+    # draw_hud now returns clicked_friend_id (FIX 6)
+    mx_now, my_now = pygame.mouse.get_pos()
+    clicked_friend_id = draw_hud(
+        hud_surf, world, agents, selected_agent, pop_history,
+        sim_speed_ref, fps=fps_now, cam_yaw=renderer.cam_yaw,
+    )
+
+    # Colonist leaderboard
+    clicked_from_list = draw_colonist_panel(
+        hud_surf, mx_now, my_now, agents, selected_agent,
+        agent_panel_active=bool(selected_agent and not selected_agent.is_dead),
+    )
+
+    # FIX 6 — Handle friend-list click: select the friend
+    if pygame.mouse.get_pressed()[0]:
+        if clicked_friend_id:
+            found = _find_agent_by_id(agents, clicked_friend_id)
+            if found:
+                selected_agent = found
+        if clicked_from_list:
+            selected_agent = clicked_from_list
+
+    raw     = pygame.image.tostring(hud_surf, "RGBA", False)
     hud_tex.write(raw)
     hud_tex.use(0)
+    ctx.disable(moderngl.DEPTH_TEST)
     ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
     hud_vao.render(moderngl.TRIANGLES)
+    ctx.enable(moderngl.DEPTH_TEST)
 
     pygame.display.flip()
     clock.tick(TARGET_FPS)

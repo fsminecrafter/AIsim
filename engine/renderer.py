@@ -1,117 +1,185 @@
 """
-GPU Renderer — ModernGL (OpenGL 3.3 core)
-Uses instanced drawing so the entire world grid + all agents are
-rendered in a handful of draw calls, with the GPU handling
-colour / position transforms.
-
-Architecture:
-  - World tiles: one quad per tile, colour from terrain/object/fire
-    packed into a float32 instance buffer uploaded each frame.
-  - Agents:      small circle quads, position + colour instanced.
-  - Dropped items: tiny dot quads.
-  - Overlay:     fire glow (additive blending), day/night tint.
+3D GPU Renderer — ModernGL (OpenGL 3.3 core)  v4
+================================================
+Key changes from v3:
+  * SMOOTH HILLS: tiles use world.height_map (continuous float) instead of
+    discrete terrain-type heights. Each tile's box is tall enough to reach
+    the ground — gap-free rendering on all sides.
+  * TILE SKIRT: tile box height = max(h_centre + 0.4, h_neighbour_max + 0.1)
+    so no side gaps even on steep slopes.
+  * Farm structure rendering (S_FARM).
+  * Larger map (WORLD_W/H = 128) handled transparently.
 """
 
 import numpy as np
 import moderngl
+import math
 from engine.config import *
 from world.world import (T_GRASS, T_DIRT, T_ROCK, T_RIVER,
                           O_NONE, O_TREE, O_BERRY, O_WHEAT, O_ROCK_OBJ,
-                          S_NONE, S_HOUSE, S_FIREPLACE)
+                          S_NONE, S_HOUSE, S_FIREPLACE, S_FARM)
+
+
+# ─── math helpers ────────────────────────────────────────────
+
+def _perspective(fovy_deg, aspect, near, far):
+    f = 1.0 / math.tan(math.radians(fovy_deg) / 2.0)
+    m = np.zeros((4, 4), dtype=np.float32)
+    m[0, 0] = f / aspect
+    m[1, 1] = f
+    m[2, 2] = (far + near) / (near - far)
+    m[2, 3] = (2 * far * near) / (near - far)
+    m[3, 2] = -1.0
+    return m
+
+
+def _look_at(eye, center, up):
+    eye    = np.array(eye,    dtype=np.float32)
+    center = np.array(center, dtype=np.float32)
+    up     = np.array(up,     dtype=np.float32)
+    f = center - eye;  f /= np.linalg.norm(f)
+    s = np.cross(f, up); s /= np.linalg.norm(s)
+    u = np.cross(s, f)
+    m = np.eye(4, dtype=np.float32)
+    m[0, :3] = s;  m[0, 3] = -np.dot(s, eye)
+    m[1, :3] = u;  m[1, 3] = -np.dot(u, eye)
+    m[2, :3] = -f; m[2, 3] =  np.dot(f, eye)
+    return m
+
+
+def _mat_mul(a, b):
+    return (a @ b).astype(np.float32)
+
+
+# ─── mesh builders ───────────────────────────────────────────
+
+def _box_mesh():
+    faces = [
+        ([ 0.5,-0.5,-0.5],[ 0.5,-0.5, 0.5],[ 0.5, 0.5, 0.5],[ 0.5, 0.5,-0.5],[1,0,0]),
+        ([-0.5,-0.5, 0.5],[-0.5,-0.5,-0.5],[-0.5, 0.5,-0.5],[-0.5, 0.5, 0.5],[-1,0,0]),
+        ([-0.5, 0.5,-0.5],[ 0.5, 0.5,-0.5],[ 0.5, 0.5, 0.5],[-0.5, 0.5, 0.5],[0,1,0]),
+        ([-0.5,-0.5, 0.5],[ 0.5,-0.5, 0.5],[ 0.5,-0.5,-0.5],[-0.5,-0.5,-0.5],[0,-1,0]),
+        ([-0.5,-0.5, 0.5],[ 0.5,-0.5, 0.5],[ 0.5, 0.5, 0.5],[-0.5, 0.5, 0.5],[0,0,1]),
+        ([ 0.5,-0.5,-0.5],[-0.5,-0.5,-0.5],[-0.5, 0.5,-0.5],[ 0.5, 0.5,-0.5],[0,0,-1]),
+    ]
+    verts, norms, idxs, base = [], [], [], 0
+    for v0, v1, v2, v3, n in faces:
+        for v in [v0, v1, v2, v3]:
+            verts.extend(v); norms.extend(n)
+        idxs.extend([base, base+1, base+2, base, base+2, base+3])
+        base += 4
+    return (np.array(verts, np.float32).reshape(-1,3),
+            np.array(norms, np.float32).reshape(-1,3),
+            np.array(idxs,  np.uint32))
+
+
+def _cylinder_mesh(segs=12):
+    verts, norms, idxs, base = [], [], [], 0
+    for i in range(segs):
+        a0 = 2*math.pi*i/segs;     a1 = 2*math.pi*(i+1)/segs
+        x0,z0 = 0.5*math.cos(a0), 0.5*math.sin(a0)
+        x1,z1 = 0.5*math.cos(a1), 0.5*math.sin(a1)
+        for x,z,y in [(x0,z0,0),(x1,z1,0),(x1,z1,1),(x0,z0,1)]:
+            verts.extend([x,y,z]); norms.extend([x*2,0,z*2])
+        idxs.extend([base, base+1, base+2, base, base+2, base+3]); base += 4
+    for i in range(segs):
+        a0 = 2*math.pi*i/segs;     a1 = 2*math.pi*(i+1)/segs
+        for x,z,y in [(0,0,1),(0.5*math.cos(a0),0.5*math.sin(a0),1),(0.5*math.cos(a1),0.5*math.sin(a1),1)]:
+            verts.extend([x,y,z]); norms.extend([0,1,0])
+        idxs.extend([base, base+1, base+2]); base += 3
+    return (np.array(verts, np.float32).reshape(-1,3),
+            np.array(norms, np.float32).reshape(-1,3),
+            np.array(idxs,  np.uint32))
+
+
+def _sphere_mesh(segs=12):
+    verts, norms, idxs, base = [], [], [], 0
+    rings = max(segs//2, 3)
+    for i in range(rings):
+        lat0 = math.pi*(-0.5+i/rings);    lat1 = math.pi*(-0.5+(i+1)/rings)
+        for j in range(segs):
+            lon0 = 2*math.pi*j/segs;      lon1 = 2*math.pi*(j+1)/segs
+            for lat, lon in [(lat0,lon0),(lat0,lon1),(lat1,lon1),(lat1,lon0)]:
+                x = 0.5*math.cos(lat)*math.cos(lon)
+                y = 0.5*math.sin(lat)
+                z = 0.5*math.cos(lat)*math.sin(lon)
+                verts.extend([x,y,z]); norms.extend([x*2,y*2,z*2])
+            idxs.extend([base, base+1, base+2, base, base+2, base+3]); base += 4
+    return (np.array(verts, np.float32).reshape(-1,3),
+            np.array(norms, np.float32).reshape(-1,3),
+            np.array(idxs,  np.uint32))
+
+
+def _pack_mesh(verts, norms):
+    return np.hstack([verts, norms]).astype(np.float32)
 
 
 # ─── GLSL shaders ────────────────────────────────────────────
 
-TILE_VERT = """
+VERT_3D = """
 #version 330 core
-in vec2 in_vert;          // unit quad [-0.5, 0.5]
-in vec4 in_pos_size;      // instance: (world_x, world_y, size, pad)
-in vec4 in_color;         // instance: RGBA
+layout(location = 0) in vec3 in_pos;
+layout(location = 1) in vec3 in_normal;
+layout(location = 2) in vec3 in_inst_pos;
+layout(location = 3) in vec3 in_inst_scale;
+layout(location = 4) in vec4 in_inst_color;
 
-uniform mat4 u_proj;
+uniform mat4 u_mvp;
+uniform vec3 u_light_dir;
+uniform float u_night;
+uniform float u_weather_dark;
 
 out vec4 v_color;
-out vec2 v_uv;
 
 void main() {
-    float sz = in_pos_size.z;
-    vec2 world_pos = vec2(in_pos_size.x + in_vert.x * sz,
-                          in_pos_size.y + in_vert.y * sz);
-    gl_Position = u_proj * vec4(world_pos, 0.0, 1.0);
-    v_color = in_color;
-    v_uv = in_vert + 0.5;
+    vec3 world = in_inst_pos + in_pos * in_inst_scale;
+    gl_Position = u_mvp * vec4(world, 1.0);
+
+    float diff  = max(dot(normalize(in_normal), normalize(u_light_dir)), 0.0);
+    float light = 0.38 + 0.62 * diff;
+    vec3  col   = in_inst_color.rgb * light;
+
+    float dist = length(world);
+    float fog  = clamp(dist * 0.0018, 0.0, 0.45);
+    vec3  sky  = mix(vec3(0.52, 0.63, 0.76), vec3(0.02,0.04,0.12), u_night);
+    col = mix(col, sky, fog);
+
+    col = mix(col, col * vec3(0.14,0.16,0.28), u_night * 0.68);
+    col *= (1.0 - u_weather_dark * 0.4);
+
+    v_color = vec4(col, in_inst_color.a);
 }
 """
 
-TILE_FRAG = """
+FRAG_3D = """
 #version 330 core
 in vec4 v_color;
-in vec2 v_uv;
 out vec4 frag_color;
-void main() {
-    frag_color = v_color;
-}
-"""
-
-AGENT_VERT = """
-#version 330 core
-in vec2 in_vert;
-in vec3 in_pos;           // (world_x, world_y, radius)
-in vec4 in_color;
-in float in_health;       // 0-1 for health bar
-
-uniform mat4 u_proj;
-
-out vec4 v_color;
-out vec2 v_uv;
-out float v_health;
-
-void main() {
-    vec2 wpos = in_pos.xy + in_vert * in_pos.z;
-    gl_Position = u_proj * vec4(wpos, 0.0, 1.0);
-    v_color = in_color;
-    v_uv    = in_vert;
-    v_health = in_health;
-}
-"""
-
-AGENT_FRAG = """
-#version 330 core
-in vec4 v_color;
-in vec2 v_uv;
-in float v_health;
-out vec4 frag_color;
-
-void main() {
-    float dist = length(v_uv);
-    if (dist > 0.5) discard;
-    // soft edge
-    float alpha = 1.0 - smoothstep(0.38, 0.5, dist);
-    // health ring — outer 10% of radius
-    if (dist > 0.38) {
-        vec3 hcol = mix(vec3(0.9,0.1,0.1), vec3(0.1,0.9,0.2), v_health);
-        frag_color = vec4(hcol, alpha);
-    } else {
-        frag_color = vec4(v_color.rgb, v_color.a * alpha);
-    }
-}
+void main() { frag_color = v_color; }
 """
 
 FIRE_VERT = """
 #version 330 core
-in vec2 in_vert;
-in vec4 in_pos_intensity;  // (x, y, intensity 0-100, pad)
+in vec2 in_quad;
+in vec3 in_fire_pos;
+in float in_fire_intensity;
 
-uniform mat4 u_proj;
+uniform mat4 u_mvp;
+uniform mat4 u_view;
+
 out float v_intensity;
 out vec2  v_uv;
 
 void main() {
-    float sz = 1.2 + in_pos_intensity.z * 0.02;
-    vec2 wpos = in_pos_intensity.xy + in_vert * sz;
-    gl_Position = u_proj * vec4(wpos, 0.0, 1.0);
-    v_intensity = in_pos_intensity.z / 100.0;
-    v_uv = in_vert;
+    float sz = 0.5 + in_fire_intensity * 0.014;
+    vec3 cam_right = vec3(u_view[0][0], u_view[1][0], u_view[2][0]);
+    vec3 cam_up    = vec3(u_view[0][1], u_view[1][1], u_view[2][1]);
+    vec3 world = in_fire_pos
+               + cam_right * in_quad.x * sz
+               + cam_up    * in_quad.y * sz * 1.5;
+    gl_Position = u_mvp * vec4(world, 1.0);
+    v_intensity = in_fire_intensity / 80.0;
+    v_uv = in_quad * 0.5 + 0.5;
 }
 """
 
@@ -120,55 +188,54 @@ FIRE_FRAG = """
 in float v_intensity;
 in vec2  v_uv;
 out vec4 frag_color;
-
 void main() {
-    float dist = length(v_uv);
-    if (dist > 0.5) discard;
-    float core = 1.0 - dist * 2.0;
-    vec3 fire = mix(vec3(0.9, 0.3, 0.0), vec3(1.0, 0.9, 0.1), core);
-    float alpha = v_intensity * core * 0.85;
-    frag_color = vec4(fire, alpha);
+    vec2 d = v_uv - vec2(0.5, 0.35);
+    float r = length(d * vec2(1.0, 1.35));
+    if (r > 0.5) discard;
+    float core = clamp(1.0 - r * 2.0, 0.0, 1.0);
+    vec3 col = mix(vec3(0.95,0.28,0.0), vec3(1.0,0.95,0.2), core);
+    frag_color = vec4(col, v_intensity * core * 0.88);
 }
 """
 
 OVERLAY_VERT = """
 #version 330 core
 in vec2 in_vert;
-out vec2 v_uv;
-void main() {
-    gl_Position = vec4(in_vert, 0.0, 1.0);
-    v_uv = in_vert * 0.5 + 0.5;
-}
+void main() { gl_Position = vec4(in_vert, 0.0, 1.0); }
 """
-
 OVERLAY_FRAG = """
 #version 330 core
-in vec2 v_uv;
 out vec4 frag_color;
-uniform float u_night;     // 0=day, 1=night
-uniform float u_season;    // 0=spring 1=summer 2=autumn 3=winter
+uniform float u_night;
+uniform float u_weather_dark;
 void main() {
-    vec4 day_col   = vec4(0.0, 0.0, 0.0, 0.0);
-    vec4 night_col = vec4(0.02, 0.04, 0.12, 0.55);
-    // winter blue tint
-    vec4 winter_col = vec4(0.05, 0.08, 0.18, 0.22 * step(2.5, u_season));
-    vec4 col = mix(day_col, night_col, u_night);
-    col += winter_col;
-    frag_color = col;
+    float a = u_night * 0.42 + u_weather_dark * 0.28;
+    vec3  c = mix(vec3(0.0), vec3(0.02,0.04,0.14), u_night);
+    frag_color = vec4(c, a);
 }
 """
 
+PARTICLE_VERT = """
+#version 330 core
+in vec3 in_pos;
+in float in_alpha;
+uniform mat4 u_mvp;
+out float v_alpha;
+void main() {
+    gl_Position = u_mvp * vec4(in_pos, 1.0);
+    gl_PointSize = 2.0;
+    v_alpha = in_alpha;
+}
+"""
+PARTICLE_FRAG = """
+#version 330 core
+in float v_alpha;
+out vec4 frag_color;
+void main() { frag_color = vec4(0.72, 0.82, 1.0, v_alpha); }
+"""
 
-def ortho(left, right, bottom, top):
-    """2D orthographic projection matrix (column-major)."""
-    m = np.eye(4, dtype=np.float32)
-    m[0,0] =  2.0 / (right - left)
-    m[1,1] =  2.0 / (top - bottom)
-    m[2,2] = -1.0
-    m[3,0] = -(right + left) / (right - left)
-    m[3,1] = -(top + bottom) / (top - bottom)
-    return m
 
+# ─── Renderer ────────────────────────────────────────────────
 
 class Renderer:
     def __init__(self, ctx: moderngl.Context, screen_w, screen_h):
@@ -176,213 +243,439 @@ class Renderer:
         self.screen_w = screen_w
         self.screen_h = screen_h
 
-        # camera
-        self.cam_x    = WORLD_W * TILE_SIZE / 2
-        self.cam_y    = WORLD_H * TILE_SIZE / 2
-        self.zoom     = 1.0           # tiles per pixel roughly
-        self._view_w  = screen_w / 14.0   # tiles visible
-        self._view_h  = screen_h / 14.0
+        self.cam_pitch  = -52.0
+        self.cam_yaw    = 0.0
+        self.cam_dist   = 36.0
+        self.cam_target = np.array([WORLD_W * TILE_SIZE / 2,
+                                     0.0,
+                                     WORLD_H * TILE_SIZE / 2], dtype=np.float32)
+        self.zoom = 1.0
 
-        # compile programs
-        self.prog_tile  = ctx.program(vertex_shader=TILE_VERT,  fragment_shader=TILE_FRAG)
-        self.prog_agent = ctx.program(vertex_shader=AGENT_VERT, fragment_shader=AGENT_FRAG)
-        self.prog_fire  = ctx.program(vertex_shader=FIRE_VERT,  fragment_shader=FIRE_FRAG)
-        self.prog_over  = ctx.program(vertex_shader=OVERLAY_VERT, fragment_shader=OVERLAY_FRAG)
+        self.prog_3d   = ctx.program(vertex_shader=VERT_3D,      fragment_shader=FRAG_3D)
+        self.prog_fire = ctx.program(vertex_shader=FIRE_VERT,    fragment_shader=FIRE_FRAG)
+        self.prog_over = ctx.program(vertex_shader=OVERLAY_VERT, fragment_shader=OVERLAY_FRAG)
+        self.prog_part = ctx.program(vertex_shader=PARTICLE_VERT,fragment_shader=PARTICLE_FRAG)
 
-        # unit quad
-        quad = np.array([[-0.5,-0.5],[0.5,-0.5],[0.5,0.5],
-                         [-0.5,-0.5],[0.5,0.5],[-0.5,0.5]], dtype=np.float32)
-        self.quad_vbo = ctx.buffer(quad.tobytes())
+        box_v, box_n, box_i = _box_mesh()
+        cyl_v, cyl_n, cyl_i = _cylinder_mesh(12)
+        sph_v, sph_n, sph_i = _sphere_mesh(12)
 
-        # tile instances (pre-allocate max)
-        N = WORLD_W * WORLD_H
-        self._tile_pos_color = np.zeros((N, 8), dtype=np.float32)  # x y size pad r g b a
-        self.tile_inst_buf   = ctx.buffer(reserve=N * 8 * 4, dynamic=True)
-        self.tile_vao = ctx.vertex_array(self.prog_tile, [
-            (self.quad_vbo,     '2f',  'in_vert'),
-            (self.tile_inst_buf,'4f/i','in_pos_size'),
-            (self.tile_inst_buf,'4f/i','in_color'),
+        self._box_vbo = ctx.buffer(_pack_mesh(box_v, box_n).tobytes())
+        self._cyl_vbo = ctx.buffer(_pack_mesh(cyl_v, cyl_n).tobytes())
+        self._sph_vbo = ctx.buffer(_pack_mesh(sph_v, sph_n).tobytes())
+        self._box_ibo = ctx.buffer(box_i.tobytes())
+        self._cyl_ibo = ctx.buffer(cyl_i.tobytes())
+        self._sph_ibo = ctx.buffer(sph_i.tobytes())
+
+        MAX_INST = WORLD_W * WORLD_H * 6
+        self._inst_buf = ctx.buffer(reserve=MAX_INST * 10 * 4, dynamic=True)
+
+        self._vao_box = self._make_vao(self._box_vbo, self._box_ibo)
+        self._vao_cyl = self._make_vao(self._cyl_vbo, self._cyl_ibo)
+        self._vao_sph = self._make_vao(self._sph_vbo, self._sph_ibo)
+
+        fire_quad = np.array([[-1,-1],[1,-1],[1,1],[-1,-1],[1,1],[-1,1]], dtype=np.float32)
+        self._fire_quad_vbo = ctx.buffer(fire_quad.tobytes())
+        self._fire_inst_buf = ctx.buffer(reserve=WORLD_W*WORLD_H*4*4, dynamic=True)
+        self._fire_vao = ctx.vertex_array(self.prog_fire, [
+            (self._fire_quad_vbo, '2f',       'in_quad'),
+            (self._fire_inst_buf, '3f 1f /i', 'in_fire_pos', 'in_fire_intensity'),
         ])
 
-        # agent instances
-        MAXAG = MAX_AGENTS
-        self.agent_inst_buf = ctx.buffer(reserve=MAXAG * (3+4+1) * 4, dynamic=True)
-        self.agent_vao = ctx.vertex_array(self.prog_agent, [
-            (self.quad_vbo,      '2f',  'in_vert'),
-            (self.agent_inst_buf,'3f/i','in_pos'),
-            (self.agent_inst_buf,'4f/i','in_color'),
-            (self.agent_inst_buf,'1f/i','in_health'),
-        ])
+        fs = np.array([[-1,-1],[1,-1],[1,1],[-1,-1],[1,1],[-1,1]], dtype=np.float32)
+        self._fs_vbo   = ctx.buffer(fs.tobytes())
+        self._over_vao = ctx.vertex_array(self.prog_over, [(self._fs_vbo, '2f', 'in_vert')])
 
-        # fire instances
-        self.fire_inst_buf = ctx.buffer(reserve=WORLD_W*WORLD_H * 4*4, dynamic=True)
-        self.fire_vao = ctx.vertex_array(self.prog_fire, [
-            (self.quad_vbo,     '2f',  'in_vert'),
-            (self.fire_inst_buf,'4f/i','in_pos_intensity'),
-        ])
+        self._part_vbo = ctx.buffer(reserve=4000*4*4, dynamic=True)
+        self._part_vao = ctx.vertex_array(self.prog_part,
+                                           [(self._part_vbo, '3f 1f', 'in_pos', 'in_alpha')])
+        self._particles  = []
+        self._part_timer = 0.0
 
-        # fullscreen quad for overlay
-        fs_quad = np.array([[-1,-1],[1,-1],[1,1],[-1,-1],[1,1],[-1,1]], dtype=np.float32)
-        self.fs_vbo = ctx.buffer(fs_quad.tobytes())
-        self.over_vao = ctx.vertex_array(self.prog_over, [(self.fs_vbo,'2f','in_vert')])
-
-        # GL state
         ctx.enable(moderngl.BLEND)
+        ctx.enable(moderngl.DEPTH_TEST)
         ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
 
+        # Cached heightmap for renderer (built once from world.height_map)
+        self._height_map = None
+
+    def _make_vao(self, mesh_vbo, ibo):
+        return self.ctx.vertex_array(self.prog_3d, [
+            (self._inst_buf, '3f 3f 4f /i', 'in_inst_pos', 'in_inst_scale', 'in_inst_color'),
+            (mesh_vbo,       '3f 3f',        'in_pos', 'in_normal'),
+        ], ibo)
+
     # ── camera ───────────────────────────────────────────────
+
     def pan(self, dx, dy):
-        self.cam_x += dx
-        self.cam_y += dy
+        yr = math.radians(self.cam_yaw)
+        self.cam_target[0] += math.cos(yr)*dx - math.sin(yr)*dy
+        self.cam_target[2] += math.sin(yr)*dx + math.cos(yr)*dy
 
     def zoom_by(self, factor):
-        self.zoom = max(0.3, min(3.0, self.zoom * factor))
+        self.cam_dist = max(5.0, min(120.0, self.cam_dist / factor))
 
-    def _proj(self):
-        hw = self._view_w * TILE_SIZE / (2 * self.zoom)
-        hh = self._view_h * TILE_SIZE / (2 * self.zoom)
-        return ortho(self.cam_x - hw, self.cam_x + hw,
-                     self.cam_y - hh, self.cam_y + hh)
+    def orbit(self, dyaw, dpitch):
+        self.cam_yaw   = (self.cam_yaw + dyaw) % 360
+        self.cam_pitch = max(-85, min(-15, self.cam_pitch + dpitch))
 
-    # ── render frame ─────────────────────────────────────────
-    def render(self, world, agents):
+    def _visible_tile_range(self, margin=4):
+        T = TILE_SIZE
+        half = self.cam_dist * 1.4 + 24.0
+        cx = self.cam_target[0] / T
+        cy = self.cam_target[2] / T
+        x0 = max(0, int(cx - half/T) - margin)
+        x1 = min(WORLD_W, int(cx + half/T) + margin + 1)
+        y0 = max(0, int(cy - half/T) - margin)
+        y1 = min(WORLD_H, int(cy + half/T) + margin + 1)
+        return x0, x1, y0, y1
+
+    def screen_to_world(self, sx, sy):
+        norm_x = (sx / max(self.screen_w, 1) - 0.5) * 2
+        norm_y = -(sy / max(self.screen_h, 1) - 0.5) * 2
+        scale  = self.cam_dist * 0.28
+        return (self.cam_target[0] + norm_x*scale,
+                self.cam_target[2] - norm_y*scale)
+
+    def _get_view_proj(self):
+        aspect = max(self.screen_w, 1) / max(self.screen_h, 1)
+        proj   = _perspective(45.0 / self.zoom, aspect, 0.5, 800.0)
+        pr = math.radians(self.cam_pitch)
+        yr = math.radians(self.cam_yaw)
+        eye_off = np.array([
+             self.cam_dist * math.cos(pr) * math.sin(yr),
+            -self.cam_dist * math.sin(pr),
+             self.cam_dist * math.cos(pr) * math.cos(yr),
+        ], dtype=np.float32)
+        eye  = self.cam_target + eye_off
+        view = _look_at(eye, self.cam_target, [0, 1, 0])
+        return view, _mat_mul(proj, view)
+
+    def _light_dir(self, world):
+        tod = world.time_of_day
+        a   = math.pi * tod
+        lx = math.cos(a); ly = math.sin(a) + 0.3; lz = 0.5
+        ln = math.sqrt(lx*lx + ly*ly + lz*lz)
+        return [lx/ln, ly/ln, lz/ln]
+
+    # ── Smooth height access ──────────────────────────────────
+
+    def _build_height_map(self, world):
+        """Copy world.height_map into the renderer cache."""
+        self._height_map = world.height_map.copy()
+
+    def _h(self, ty, tx):
+        """World-space Y of the TOP of tile (ty, tx)."""
+        if self._height_map is None:
+            return 0.0
+        ty = max(0, min(WORLD_H-1, ty))
+        tx = max(0, min(WORLD_W-1, tx))
+        return float(self._height_map[ty, tx])
+
+    def _tile_skirt_height(self, ty, tx):
+        """
+        Return the height a tile box must have so its sides reach deep
+        enough to hide any gap with neighbours.
+        = max height among the tile and all 4 immediate neighbours + a margin.
+        This prevents see-through gaps on steep slopes.
+        """
+        h_max = self._h(ty, tx)
+        for dy, dx in ((-1,0),(1,0),(0,-1),(0,1)):
+            h_max = max(h_max, self._h(ty+dy, tx+dx))
+        return h_max + 0.5   # 0.5 extra so even sharp drops are covered
+
+    # ── render ───────────────────────────────────────────────
+
+    def render(self, world, agents, dt=0.016):
         ctx = self.ctx
-        ctx.clear(0.05, 0.05, 0.05, 1.0)
+        ctx.clear(0.45, 0.60, 0.75, 1.0)
+        ctx.enable(moderngl.DEPTH_TEST)
+        ctx.depth_func = '<'
+        ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
 
-        proj = self._proj()
+        if self._height_map is None:
+            self._build_height_map(world)
 
-        # ── 1. Build tile instance data ───────────────────────
-        N   = WORLD_W * WORLD_H
-        buf = np.zeros((N, 8), dtype=np.float32)
-        idx = 0
-        for gy in range(WORLD_H):
-            for gx in range(WORLD_W):
-                wx = (gx + 0.5) * TILE_SIZE
-                wy = (gy + 0.5) * TILE_SIZE
-                r, g, b = self._tile_color(world, gy, gx)
-                buf[idx, 0] = wx
-                buf[idx, 1] = wy
-                buf[idx, 2] = TILE_SIZE * 0.98
-                buf[idx, 3] = 0.0
-                buf[idx, 4] = r
-                buf[idx, 5] = g
-                buf[idx, 6] = b
-                buf[idx, 7] = 1.0
-                idx += 1
+        view, mvp = self._get_view_proj()
+        mvp_b  = mvp.T.tobytes()
+        view_b = view.T.tobytes()
 
-        self.tile_inst_buf.write(buf.tobytes())
-        self.prog_tile["u_proj"].write(proj.tobytes())
-        self.tile_vao.render(moderngl.TRIANGLES, instances=N)
+        tod          = world.time_of_day
+        night        = max(0.0, min(1.0, abs(tod-0.5)*4-1.0))
+        weather_dark = {"storm": 0.35, "blizzard": 0.28, "rain": 0.12}.get(world.weather, 0.0)
 
-        # ── 2. Fire glow (additive blend) ─────────────────────
-        fire_tiles = np.argwhere(world.fire_intensity > 0)
+        self.prog_3d["u_mvp"].write(mvp_b)
+        self.prog_3d["u_light_dir"].value = tuple(self._light_dir(world))
+        self.prog_3d["u_night"].value        = night
+        self.prog_3d["u_weather_dark"].value = weather_dark
+
+        self._draw_terrain(world)
+        self._draw_objects(world)
+        self._draw_structures(world)
+
+        gx0, gx1, gy0, gy1 = self._visible_tile_range(margin=2)
+        fire_mask = np.zeros_like(world.fire_intensity, dtype=bool)
+        fire_mask[gy0:gy1, gx0:gx1] = world.fire_intensity[gy0:gy1, gx0:gx1] > 0
+        fire_tiles = np.argwhere(fire_mask)
         if len(fire_tiles) > 0:
             fbuf = np.zeros((len(fire_tiles), 4), dtype=np.float32)
             for i, (fy, fx) in enumerate(fire_tiles):
-                fbuf[i, 0] = (fx + 0.5) * TILE_SIZE
-                fbuf[i, 1] = (fy + 0.5) * TILE_SIZE
-                fbuf[i, 2] = world.fire_intensity[fy, fx]
-                fbuf[i, 3] = 0.0
-            self.fire_inst_buf.write(fbuf.tobytes())
-            # additive blend for glow
+                fbuf[i,0] = fx*TILE_SIZE + TILE_SIZE/2
+                fbuf[i,1] = self._h(fy, fx) + 0.6
+                fbuf[i,2] = fy*TILE_SIZE + TILE_SIZE/2
+                fbuf[i,3] = world.fire_intensity[fy, fx]
+            self._fire_inst_buf.orphan(size=len(fire_tiles)*4*4)
+            self._fire_inst_buf.write(fbuf.tobytes())
+            self.prog_fire["u_mvp"].write(mvp_b)
+            self.prog_fire["u_view"].write(view_b)
             ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE)
-            self.prog_fire["u_proj"].write(proj.tobytes())
-            self.fire_vao.render(moderngl.TRIANGLES, instances=len(fire_tiles))
+            ctx.disable(moderngl.DEPTH_TEST)
+            self._fire_vao.render(moderngl.TRIANGLES, instances=len(fire_tiles))
+            ctx.enable(moderngl.DEPTH_TEST)
             ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
 
-        # ── 3. Agents ─────────────────────────────────────────
-        live = [a for a in agents if not a.is_dead]
-        if live:
-            abuf = np.zeros((len(live), 8), dtype=np.float32)
-            for i, ag in enumerate(live):
-                wx = (ag.x + 0.5) * TILE_SIZE
-                wy = (ag.y + 0.5) * TILE_SIZE
-                r, g, b = self._agent_color(ag)
-                abuf[i, 0] = wx
-                abuf[i, 1] = wy
-                abuf[i, 2] = TILE_SIZE * AGENT_RADIUS * 2
-                abuf[i, 3] = r
-                abuf[i, 4] = g
-                abuf[i, 5] = b
-                abuf[i, 6] = 1.0
-                abuf[i, 7] = ag.health / 100.0
-            self.agent_inst_buf.write(abuf.tobytes())
-            self.prog_agent["u_proj"].write(proj.tobytes())
-            self.agent_vao.render(moderngl.TRIANGLES, instances=len(live))
+        self._draw_agents(agents)
+        self._update_draw_particles(world, dt, mvp_b)
 
-        # ── 4. Night/season overlay ───────────────────────────
-        tod = world.time_of_day
-        night = max(0.0, min(1.0, abs(tod - 0.5) * 4 - 1.0))
-        self.prog_over["u_night"].value  = night
-        self.prog_over["u_season"].value = float(world.season_idx)
-        self.over_vao.render(moderngl.TRIANGLES)
+        ctx.disable(moderngl.DEPTH_TEST)
+        self.prog_over["u_night"].value        = night
+        self.prog_over["u_weather_dark"].value = weather_dark
+        self._over_vao.render(moderngl.TRIANGLES)
+        ctx.enable(moderngl.DEPTH_TEST)
 
-    # ── colour helpers ────────────────────────────────────────
-    def _tile_color(self, world, gy, gx):
-        t  = world.terrain[gy, gx]
-        ot = world.obj_type[gy, gx]
-        og = world.obj_growth[gy, gx]
-        st = world.structures[gy, gx]
+    # ── batch helper ─────────────────────────────────────────
 
-        # base terrain
-        if t == T_GRASS:  r,g,b = 0.22, 0.45, 0.15
-        elif t == T_DIRT: r,g,b = 0.55, 0.38, 0.22
-        elif t == T_ROCK: r,g,b = 0.50, 0.50, 0.52
-        else:             r,g,b = 0.15, 0.40, 0.75  # river
+    def _batch(self, vao, instances):
+        if not instances:
+            return
+        arr = np.array(instances, dtype=np.float32)
+        sz  = len(instances) * 10 * 4
+        self._inst_buf.orphan(size=sz)
+        self._inst_buf.write(arr.tobytes())
+        vao.render(moderngl.TRIANGLES, instances=len(instances))
 
-        # structure
-        if st == S_HOUSE:      r,g,b = 0.62, 0.48, 0.32
-        elif st == S_FIREPLACE: r,g,b = 0.80, 0.30, 0.00
+    # ── terrain ──────────────────────────────────────────────
 
-        # object overlay (blend based on growth)
-        elif ot == O_TREE:
-            gr = og
-            r = 0.22*(1-gr) + 0.08*gr
-            g = 0.45*(1-gr) + 0.35*gr
-            b = 0.15*(1-gr) + 0.08*gr
-        elif ot == O_BERRY:
-            r = r*(1-og) + 0.65*og
-            g = g*(1-og) + 0.10*og
-            b = b*(1-og) + 0.10*og
-        elif ot == O_WHEAT:
-            r = r*(1-og) + 0.85*og
-            g = g*(1-og) + 0.75*og
-            b = b*(1-og) + 0.05*og
-        elif ot == O_ROCK_OBJ:
-            r,g,b = 0.48, 0.46, 0.44
+    def _draw_terrain(self, world):
+        T   = TILE_SIZE
+        buf = []
+        gx0, gx1, gy0, gy1 = self._visible_tile_range(margin=2)
+        for gy in range(gy0, gy1):
+            for gx in range(gx0, gx1):
+                t  = world.terrain[gy, gx]
+                h  = self._h(gy, gx)            # top of tile
+                wx = gx * T + T/2
+                wz = gy * T + T/2
 
-        # fire tint
-        fi = world.fire_intensity[gy, gx]
-        if fi > 0:
-            fi_t = min(fi / 80.0, 1.0)
-            r = r*(1-fi_t) + 0.9*fi_t
-            g = g*(1-fi_t) + 0.2*fi_t
-            b = b*(1-fi_t) + 0.0*fi_t
+                # Skirt height: box reaches deep enough to cover all neighbours
+                skirt = self._tile_skirt_height(gy, gx)
+                tile_h = skirt + 0.4            # always >= neighbour heights
+                wy = h - tile_h/2              # centre of box in Y
 
-        return r, g, b
+                r, g, b = self._terrain_col(t, gy, gx, world)
 
-    def _agent_color(self, ag):
-        stage_cols = {
-            "baby":  (0.95, 0.85, 0.40),
-            "adult": (0.90, 0.90, 0.90) if ag.gender == "male" else (0.95, 0.65, 0.75),
-            "elder": (0.70, 0.70, 0.80),
-        }
-        base = stage_cols.get(ag.stage, (0.9, 0.9, 0.9))
-        # tint by current action
-        from ai.agent import A_FLEE_FIRE, A_FIND_FOOD, A_FIND_WATER, A_BUILD, A_SEEK_MATE
-        if ag.current_action == A_FLEE_FIRE:  return (1.0, 0.2, 0.0)
-        if ag.current_action == A_FIND_WATER: return (0.2, 0.6, 1.0)
-        if ag.current_action == A_FIND_FOOD:  return (0.6, 1.0, 0.2)
-        if ag.current_action == A_BUILD:      return (0.9, 0.7, 0.3)
-        if ag.current_action == A_SEEK_MATE:  return (1.0, 0.4, 0.8)
-        return base
+                fi = world.fire_intensity[gy, gx]
+                if fi > 0:
+                    ft = min(fi/60.0, 0.65)
+                    r = r*(1-ft) + 0.85*ft
+                    g = g*(1-ft) + 0.14*ft
+                    b = b*(1-ft)
 
-    # ── screen → world coords ─────────────────────────────────
-    def screen_to_world(self, sx, sy):
-        hw = self._view_w * TILE_SIZE / (2 * self.zoom)
-        hh = self._view_h * TILE_SIZE / (2 * self.zoom)
-        nx = (sx / self.screen_w - 0.5) * 2
-        ny = (sy / self.screen_h - 0.5) * 2
-        wx = self.cam_x + nx * hw
-        wy = self.cam_y + ny * hh
-        return wx, wy
+                buf.append([wx, wy, wz,  T*0.995, tile_h, T*0.995,  r, g, b, 1.0])
+
+        self._batch(self._vao_box, buf)
+
+    def _terrain_col(self, t, gy, gx, world):
+        if t == T_RIVER:
+            return 0.12, 0.37, 0.72
+        # Sand near river
+        H, W = WORLD_H, WORLD_W
+        for dy in range(-1, 2):
+            for dx in range(-1, 2):
+                ny, nx = gy+dy, gx+dx
+                if 0 <= ny < H and 0 <= nx < W:
+                    if world.terrain[ny, nx] == T_RIVER:
+                        return 0.85, 0.76, 0.48
+        if t == T_ROCK:
+            h = self._h(gy, gx)
+            # Snow cap on high peaks
+            if h > 2.6:
+                return 0.88, 0.90, 0.94
+            return 0.54, 0.52, 0.50
+        season = world.season_name
+        if t == T_GRASS:
+            if season == "autumn": return 0.56, 0.42, 0.12
+            if season == "winter": return 0.80, 0.83, 0.88
+            return 0.22, 0.46, 0.15
+        return 0.55, 0.38, 0.22   # dirt
+
+    # ── objects ──────────────────────────────────────────────
+
+    def _draw_objects(self, world):
+        T = TILE_SIZE
+        cyl_buf, sph_buf, box_buf = [], [], []
+        gx0, gx1, gy0, gy1 = self._visible_tile_range(margin=3)
+
+        for gy in range(gy0, gy1):
+            for gx in range(gx0, gx1):
+                ot = world.obj_type[gy, gx]
+                if ot == O_NONE:
+                    continue
+                og = world.obj_growth[gy, gx]
+                h  = self._h(gy, gx)
+                wx = gx * T + T/2
+                wz = gy * T + T/2
+                wy = h   # objects sit on TOP of the tile
+
+                if ot == O_TREE:
+                    th = 1.5 + og * 2.5
+                    tr = 0.20 + og * 0.14
+                    cyl_buf.append([wx, wy,      wz,  tr*2, th, tr*2,  0.50, 0.34, 0.16, 1.0])
+                    cr = 1.2*og + 0.3
+                    g_r, g_g, g_b = (0.28+og*0.10, 0.60-og*0.04, 0.12)
+                    sph_buf.append([wx, wy+th,   wz,  cr*2, cr*2, cr*2,  g_r, g_g, g_b, 1.0])
+
+                elif ot == O_BERRY:
+                    sz = 0.45 + og*0.32
+                    sph_buf.append([wx, wy+sz*0.5, wz,  sz, sz*0.65, sz,  0.18, 0.48, 0.14, 1.0])
+                    if og > 0.5:
+                        for bdy, bdx in [(-0.18,0.14),(0.14,-0.10),(0.10,0.18)]:
+                            sph_buf.append([wx+bdx*T*0.15, wy+sz*0.82, wz+bdy*T*0.15,
+                                            0.13,0.13,0.13,  0.82,0.14,0.14, 1.0])
+
+                elif ot == O_WHEAT:
+                    hs = 0.6 + og*0.9
+                    r2,g2,b2 = (0.85,0.72,0.12) if og > 0.7 else (0.45,0.70,0.22)
+                    for ox, oz in [(0,0),(0.14,0.14),(-0.12,-0.08)]:
+                        box_buf.append([wx+ox, wy+hs*0.5, wz+oz,  0.09,hs,0.09,  r2,g2,b2, 1.0])
+
+                elif ot == O_ROCK_OBJ:
+                    box_buf.append([wx, wy+0.22, wz,  0.50,0.34,0.46,  0.56,0.53,0.52, 1.0])
+                    box_buf.append([wx+0.18, wy+0.15, wz-0.08,  0.30,0.24,0.28,  0.48,0.46,0.44, 1.0])
+
+        self._batch(self._vao_cyl, cyl_buf)
+        self._batch(self._vao_sph, sph_buf)
+        self._batch(self._vao_box, box_buf)
+
+    # ── structures ───────────────────────────────────────────
+
+    def _draw_structures(self, world):
+        T   = TILE_SIZE
+        buf = []
+        gx0, gx1, gy0, gy1 = self._visible_tile_range(margin=2)
+        for gy in range(gy0, gy1):
+            for gx in range(gx0, gx1):
+                s = world.structures[gy, gx]
+                if s == S_NONE:
+                    continue
+                h  = self._h(gy, gx)
+                wx = gx*T + T/2
+                wz = gy*T + T/2
+                wy = h   # sit on top of tile
+
+                if s == S_HOUSE:
+                    # Main walls
+                    buf.append([wx, wy+0.8,  wz,  T*0.88, 1.6, T*0.88,  0.62, 0.48, 0.32, 1.0])
+                    # Roof ridge
+                    buf.append([wx, wy+1.72, wz,  T*0.92, 0.38, T*0.92, 0.44, 0.30, 0.18, 1.0])
+                    # Door
+                    buf.append([wx, wy+0.38, wz+T*0.44,  0.35, 0.76, 0.08,  0.28, 0.18, 0.10, 1.0])
+
+                elif s == S_FIREPLACE:
+                    for dy, dx in [(-0.22,-0.22),(-0.22,0.22),(0.22,-0.22),(0.22,0.22)]:
+                        buf.append([wx+dx, wy+0.22, wz+dy,  0.20,0.44,0.20,  0.30,0.28,0.28, 1.0])
+                    buf.append([wx, wy+0.10, wz,  0.26,0.10,0.26,  0.94,0.40,0.05, 1.0])
+
+                elif s == S_FARM:
+                    # Farm: raised soil bed
+                    buf.append([wx, wy+0.08, wz,  T*0.92, 0.16, T*0.92,  0.45, 0.28, 0.12, 1.0])
+                    # Wooden fence posts at corners
+                    for fy, fx in [(-0.38,-0.38),(-0.38,0.38),(0.38,-0.38),(0.38,0.38)]:
+                        buf.append([wx+fx*T*0.4, wy+0.25, wz+fy*T*0.4,
+                                    0.10, 0.50, 0.10,  0.50, 0.35, 0.18, 1.0])
+
+        self._batch(self._vao_box, buf)
+
+    # ── agents ───────────────────────────────────────────────
+
+    def _draw_agents(self, agents):
+        gx0, gx1, gy0, gy1 = self._visible_tile_range(margin=4)
+        live = [a for a in agents if not a.is_dead
+                and gx0 <= a.x < gx1 and gy0 <= a.y < gy1]
+        if not live:
+            return
+        T    = TILE_SIZE
+        cyls = []
+        sphs = []
+        shad = []
+
+        for ag in live:
+            ty = max(0, min(WORLD_H-1, int(ag.y)))
+            tx = max(0, min(WORLD_W-1, int(ag.x)))
+            h  = self._h(ty, tx)
+            wx = ag.x * T + T/2
+            wz = ag.y * T + T/2
+            wy = h   # stand on terrain surface
+
+            sc = 0.65 if ag.stage == "baby" else (0.88 if ag.stage == "elder" else 0.80)
+            bh = 0.90 * sc
+            br = 0.27 * sc
+            r, g, b = self._agent_col(ag)
+
+            shad.append([wx, wy+0.02, wz,  br*2.4, 0.04, br*2.4,  0.0,0.0,0.0, 0.32])
+            cyls.append([wx, wy,      wz,  br*2,   bh,   br*2,    r, g, b, 1.0])
+            hr = 0.21 * sc
+            sphs.append([wx, wy+bh+hr, wz,  hr*2,hr*2,hr*2,
+                         min(1.0,r*1.08), min(1.0,g*1.08), min(1.0,b*1.08), 1.0])
+
+        self._batch(self._vao_sph, shad)
+        self._batch(self._vao_cyl, cyls)
+        self._batch(self._vao_sph, sphs)
+
+    def _agent_col(self, ag):
+        from ai.actions import A_FLEE_FIRE, A_FIND_FOOD, A_FIND_WATER, A_BUILD, A_SEEK_MATE
+        ac = {A_FLEE_FIRE:(1.0,0.22,0.0), A_FIND_WATER:(0.20,0.55,1.0),
+              A_FIND_FOOD:(0.48,1.0,0.22), A_BUILD:(0.90,0.70,0.20),
+              A_SEEK_MATE:(1.0,0.32,0.75)}
+        if ag.current_action in ac:
+            return ac[ag.current_action]
+        if ag.stage == "baby":  return 0.95, 0.85, 0.40
+        if ag.stage == "elder": return 0.65, 0.62, 0.75
+        return (0.82,0.82,0.90) if ag.gender == "male" else (0.92,0.58,0.68)
+
+    # ── weather particles ─────────────────────────────────────
+
+    def _update_draw_particles(self, world, dt, mvp_b):
+        weather = world.weather
+        if weather not in ("rain", "storm", "blizzard"):
+            self._particles = []
+            return
+
+        self._part_timer += dt
+        rate = {"rain":0.025, "storm":0.012, "blizzard":0.018}.get(weather, 0.025)
+        while self._part_timer > rate and len(self._particles) < 800:
+            self._part_timer -= rate
+            n = len(self._particles)
+            x = self.cam_target[0] + ((n*73+11) % 70 - 35)
+            z = self.cam_target[2] + ((n*37+5)  % 70 - 35)
+            vx = -1.2 if weather == "blizzard" else 0.0
+            self._particles.append([x, 22.0, z, vx, -5.5, 0.0, 0.80])
+
+        keep = []
+        for p in self._particles:
+            p[0]+=p[3]*dt; p[1]+=p[4]*dt; p[2]+=p[5]*dt
+            if p[1] > -1.0:
+                keep.append(p)
+        self._particles = keep
+
+        if not self._particles:
+            return
+        arr = np.array([[p[0],p[1],p[2],p[6]] for p in self._particles], dtype=np.float32)
+        self._part_vbo.orphan(size=len(arr)*4*4)
+        self._part_vbo.write(arr.tobytes())
+        self.prog_part["u_mvp"].write(mvp_b)
+        try:
+            self.ctx.enable(moderngl.PROGRAM_POINT_SIZE)
+        except Exception:
+            pass
+        self._part_vao.render(moderngl.POINTS, vertices=len(self._particles))
